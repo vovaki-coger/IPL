@@ -23,7 +23,9 @@ export class FeatureManager {
             if (this.features.has(name)) {
                 const oldFeature = this.features.get(name);
                 if (typeof oldFeature.dispose === 'function') {
-                    oldFeature.dispose();
+                    Promise.resolve(oldFeature.dispose()).catch(err => {
+                        console.error(`Failed to dispose feature ${name}:`, err);
+                    });
                 }
             }
 
@@ -32,6 +34,20 @@ export class FeatureManager {
             feature.init();
         } catch (err) {
             console.error(`Failed to register feature ${name}:`, err);
+        }
+    }
+
+    async disposeAll() {
+        const features = Array.from(this.features.entries()).reverse();
+        this.features.clear();
+
+        for (const [name, feature] of features) {
+            if (typeof feature.dispose !== 'function') continue;
+            try {
+                await feature.dispose();
+            } catch (err) {
+                console.error(`Failed to dispose feature ${name}:`, err);
+            }
         }
     }
 

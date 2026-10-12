@@ -8,7 +8,8 @@ export class Discord extends BaseFeature {
         this.channelId = null;
         this.queue = [];
         this.processing = false;
-        setInterval(() => this.processQueue(), 1200);
+        this.queueInterval = setInterval(() => this.processQueue(), 1200);
+        this.queueInterval.unref?.();
     }
 
     init() {
@@ -152,6 +153,11 @@ export class Discord extends BaseFeature {
     dispose() {
         if (this.chatListener) {
             this.botClient.removeListener('chat', this.chatListener);
+            this.chatListener = null;
+        }
+        if (this.queueInterval) {
+            clearInterval(this.queueInterval);
+            this.queueInterval = null;
         }
     }
 }

@@ -39,6 +39,10 @@ export class AntiAFK extends BaseFeature {
         }
     }
 
+    dispose() {
+        this.disable();
+    }
+
     startAFK() {
         this.interval = setInterval(() => {
             if (!this.botClient.bot || !this.botClient.bot.entity) return;

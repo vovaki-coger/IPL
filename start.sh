@@ -1,25 +1,17 @@
-#!/bin/bash
-# ImperialsBot - Startup Script for Linux
+#!/bin/sh
+set -e
+cd "$(dirname "$0")"
 
-echo "Checking environment..."
-
-if ! command -v node &> /dev/null
-then
-    echo "Node.js could not be found. Please install Node.js from https://nodejs.org/"
+if ! command -v node >/dev/null 2>&1; then
+    echo "[ImperialsBot] Node.js not found. Install Node 18+ first."
     exit 1
 fi
 
-echo "Checking dependencies..."
-npm install --no-audit --no-fund
-if [ $? -ne 0 ]; then
-    echo "[ERROR] npm install failed."
-    read -p "Press [Enter] to exit..."
-    exit 1
+if [ ! -d node_modules ]; then
+    echo "[ImperialsBot] Installing dependencies, this can take a few minutes..."
+    npm install
 fi
 
-echo "Starting ImperialsBot..."
-npm start
-
-echo ""
-echo "App terminated or crashed."
-read -p "Press [Enter] to exit..."
+echo "[ImperialsBot] Starting server on http://localhost:3000"
+echo "[ImperialsBot] Press Ctrl+C to stop."
+exec node index.js

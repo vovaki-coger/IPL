@@ -11,6 +11,8 @@ import { ProxyAgent } from 'proxy-agent';
 import { SocksClient } from 'socks';
 import axios from 'axios';
 import { getBasePort } from '../utils/ConfigBase.js';
+import { mergeManualMapPacket, serializeManualWindow } from '../utils/ManualWindow.js';
+import { recordCaptchaMaps } from '../utils/CaptchaSamples.js';
 
 export class BotClient extends EventEmitter {
     constructor(config) {
@@ -30,6 +32,9 @@ export class BotClient extends EventEmitter {
         this.manuallyStopped = false;
         this.recentMessages = new Set();
         this.inventoryPort = null;
+        this.activeManualWindow = null;
+        this.manualMapCache = new Map();
+        this.manualWindowUpdateHandler = null;
         this.packetDebugEnabled = false;
         this._packetListener = null;
         this.customReconnectDelay = null;
@@ -245,6 +250,11 @@ export class BotClient extends EventEmitter {
             this.reconnectTimer = null;
         }
 
+        // Reconnects create a new Mineflayer instance. Dispose feature-owned
+        // timers/listeners before replacing the old bot so analytics, viewer,
+        // navigation and Discord queues cannot survive across reconnects.
+        await this.featureManager.disposeAll();
+
         if (this.bot) {
             try {
                 this.bot.removeAllListeners();
@@ -287,8 +297,17 @@ export class BotClient extends EventEmitter {
                 }
                 if (proxies.length > 0) {
                     const maxAttempts = Math.min(5, proxies.length);
+                    // A verification link is bound to the IP the session joined
+                    // from. Picking a random proxy on every reconnect swaps that
+                    // IP and kills the link the user is holding, so the proxy
+                    // that worked last time is always tried first.
+                    const preferred = this.lastWorkingProxy || this.config.lastWorkingProxy;
+                    const ordered = preferred
+                        ? [preferred, ...proxies.filter(p => p !== preferred)]
+                        : proxies;
+
                     for (let attempts = 0; attempts < maxAttempts; attempts++) {
-                        const randomProxyStr = proxies[Math.floor(Math.random() * proxies.length)];
+                        const randomProxyStr = ordered[attempts % ordered.length];
                         try {
                             this.updateStatus(`Verifying Proxy (${attempts + 1}/${maxAttempts})...`);
                             const agent = new ProxyAgent({ getProxyForUrl: () => randomProxyStr });
@@ -299,9 +318,12 @@ export class BotClient extends EventEmitter {
                             });
                             this.log(`Found working proxy! Masked IP: ${response.data.ip}`, 'success');
                             selectedProxyStr = randomProxyStr;
+                            this.lastWorkingProxy = randomProxyStr;
+                            this.config.lastWorkingProxy = randomProxyStr;
                             break;
                         } catch (e) {
                             this.log(`Proxy verify failed: ${e.message}`, 'warning');
+                            if (randomProxyStr === preferred) this.lastWorkingProxy = null;
                             try {
                                 await ConfigLoader.removeProxyFromGlobal(randomProxyStr);
                                 this.log(`Removed dead proxy from global list automatically.`, 'info');
@@ -460,6 +482,7 @@ export class BotClient extends EventEmitter {
             this.bot = mineflayer.createBot(botOptions);
             this.bot.setMaxListeners(100);
             this.setMaxListeners(100);
+            this.patchMovementPacketFlags(this.bot._client);
 
             // This ensures connection errors are caught before bindEvents
             this.bot.on('error', (err) => {
@@ -488,6 +511,36 @@ export class BotClient extends EventEmitter {
         }
     }
 
+    patchMovementPacketFlags(client) {
+        if (!client || client.__imperialsMovementFlagsPatched || typeof client.write !== 'function') return;
+
+        const originalWrite = client.write.bind(client);
+        client.write = (packetName, packetData, ...rest) => {
+            if (
+                ['position', 'look', 'position_look'].includes(packetName) &&
+                packetData
+            ) {
+                // Minecraft 1.21.3+ serializes both movement flags as booleans.
+                // Some Mineflayer releases leave hasHorizontalCollision undefined,
+                // which causes protodef to fail before the packet is sent.
+                const sourceFlags = packetData.flags && typeof packetData.flags === 'object'
+                    ? packetData.flags
+                    : {};
+                packetData = {
+                    ...packetData,
+                    flags: {
+                        ...sourceFlags,
+                        onGround: Boolean(sourceFlags.onGround ?? packetData.onGround),
+                        hasHorizontalCollision: Boolean(sourceFlags.hasHorizontalCollision)
+                    }
+                };
+            }
+
+            return originalWrite(packetName, packetData, ...rest);
+        };
+        client.__imperialsMovementFlagsPatched = true;
+    }
+
     async savePluginStates() {
         try {
             await ConfigLoader.addBotConfig(this.config);
@@ -496,8 +549,162 @@ export class BotClient extends EventEmitter {
         }
     }
 
+    getManualWindowState() {
+        const window = serializeManualWindow(this.activeManualWindow);
+        const maps = {};
+        // Only maps the server actually put in a window slot belong here.
+        // Seeding this with every cached map filled the pane with lobby decor
+        // and flooded the dashboard with images the player never sees.
+        const mapIds = new Set();
+        if (window) {
+            for (const mapId of window.slots
+                .filter(item => item && item.mapId !== null)
+                .map(item => item.mapId)) {
+                mapIds.add(mapId);
+            }
+        }
+        for (const mapId of mapIds) {
+            const pixels = this.manualMapCache.get(mapId);
+            if (pixels) maps[mapId] = pixels.toString('base64');
+        }
+        return { window, maps };
+    }
+
+    publishManualWindowState() {
+        this.emit('manualWindowState', this.getManualWindowState());
+    }
+
     bindEvents() {
         const instance = this.bot;
+
+        // The lobby refuses players that do not enable server resources and
+        // kicks them with "Вы должны включить Наборы ресурсов". mineflayer only
+        // answers by itself during the configuration phase, so packs offered
+        // after login were left unanswered and the bot got thrown out.
+        // Diagnostic: the server drops the bot over resource packs and neither the
+// kick nor the pack exchange reaches the normal log, so the raw exchange has
+// to be visible before anything else is guessed.
+const PACK_PACKETS = new Set([
+    'add_resource_pack', 'remove_resource_pack', 'resource_pack_send',
+    'resource_pack_receive', 'resource_pack', 'configuration_finished',
+    'finish_configuration', 'settings', 'client_information'
+]);
+// Result codes from the protocol: 0 loaded, 3 accepted.
+const PACK_ACCEPTED = 3;
+const PACK_LOADED = 0;
+
+instance._client?.on('packet', (packet, meta) => {
+    if (!PACK_PACKETS.has(meta?.name)) return;
+
+    if (meta.name !== 'add_resource_pack' && meta.name !== 'resource_pack_send') return;
+
+    // Protocol 26.1 answers with { uuid, result } and has no hash field.
+    // mineflayer's helper relies on a feature flag that does not recognise this
+    // version, so it answered with an undefined uuid and the server dropped the
+    // reply. The uuid has to be echoed back from the packet that just arrived.
+    const uuid = packet?.uuid;
+    if (!uuid) {
+        this.log('[pack] pack offered without a uuid, cannot confirm it', 'warning');
+        return;
+    }
+    try {
+        instance._client.write('resource_pack_receive', { uuid, result: PACK_ACCEPTED });
+        instance._client.write('resource_pack_receive', { uuid, result: PACK_LOADED });
+        this.log(`[pack] confirmed ${uuid}, state=${instance._client?.state}`, 'info');
+    } catch (err) {
+        this.log(`[pack] confirm failed: ${err.message}`, 'warning');
+    }
+});
+instance.on('kicked', reason => this.log(`KICKED: ${JSON.stringify(reason).slice(0, 300)}`, 'error'));
+
+// Protocol-level diagnostics. Without these, a packet the server rejects
+// produces no log line at all and looks like a random disconnect.
+const packetErrors = new Map();
+const packetCounts = new Map();
+instance._client?.on('error', (err) => {
+    const text = String(err?.message || err);
+    packetErrors.set(text, (packetErrors.get(text) || 0) + 1);
+    this.log(`[packet] ошибка: ${text.slice(0, 220)}`, 'warning');
+});
+instance._client?.on('end', (reason) => {
+    if (reason) this.log(`[packet] соединение закрыто: ${String(reason).slice(0, 200)}`, 'warning');
+});
+
+// Count packets by name so a silent protocol break shows up as "the server
+// stopped sending X" instead of nothing at all. Only every 30s, and only the
+// names that actually appeared, otherwise the log drowns in entity moves.
+let lastPacketReport = 0;
+instance._client?.on('packet', (packet, meta) => {
+    const name = meta?.name || '?';
+    const entry = packetCounts.get(name) || { in: 0, out: 0 };
+    if (meta?.state !== 'handshaking') entry.in++;
+    packetCounts.set(name, entry);
+
+    const now = Date.now();
+    if (now - lastPacketReport < 30000) return;
+    lastPacketReport = now;
+
+    const top = [...packetCounts.entries()]
+        .sort((a, b) => (b[1].in + b[1].out) - (a[1].in + a[1].out))
+        .slice(0, 8)
+        .map(([n, v]) => `${n}=${v.in}`).join(' ');
+    const errText = [...packetErrors.entries()].map(([m, c]) => `${m.slice(0, 60)}×${c}`);
+    this.log(`[packet] ошибок=${packetErrors.size} ${errText.join(' | ')} :: ${top}`, 'info');
+    packetCounts.clear();
+});
+
+
+
+        instance.on('windowOpen', (window) => {
+            if (this.bot !== instance) return;
+            if (this.activeManualWindow && this.manualWindowUpdateHandler) {
+                this.activeManualWindow.removeListener('updateSlot', this.manualWindowUpdateHandler);
+            }
+            this.activeManualWindow = window;
+            this.manualWindowUpdateHandler = () => this.publishManualWindowState();
+            window.on('updateSlot', this.manualWindowUpdateHandler);
+            this.emit('windowOpen', window);
+            this.publishManualWindowState();
+        });
+        instance.on('windowClose', (window) => {
+            if (this.bot !== instance) return;
+            // Without the truthiness check, a close event carrying no window id
+            // compared equal to a null active window and threw on removeListener.
+            if (this.activeManualWindow && this.activeManualWindow.id === window?.id) {
+                this.activeManualWindow.removeListener('updateSlot', this.manualWindowUpdateHandler);
+                this.activeManualWindow = null;
+                this.manualWindowUpdateHandler = null;
+                this.publishManualWindowState();
+            }
+            this.emit('windowClose', window);
+        });
+        instance._client?.on('packet', (packet, metadata) => {
+            if (this.bot !== instance || metadata?.name !== 'map') return;
+            const mapUpdate = mergeManualMapPacket(this.manualMapCache, packet);
+            if (!mapUpdate) return;
+            // Keep real examples so CAPTCHA symbol reading can be built and tested.
+            const pixels = this.manualMapCache.get(mapUpdate.mapId);
+            // Servers send map packets for lobby decor and for every filled_map
+            // lying around, not only for a CAPTCHA. Saving all of them filled
+            // captcha_samples/ with junk that was never a challenge.
+            const shownInWindow = (this.activeManualWindow?.slots || [])
+                .some(item => item && item.mapId === mapUpdate.mapId);
+            if (shownInWindow) {
+                recordCaptchaMaps(this.username, [{ mapId: mapUpdate.mapId, pixels }]);
+            }
+            this.publishManualWindowState();
+        });
+        instance.on('end', () => {
+            if (this.bot !== instance) return;
+            if (this.activeManualWindow && this.manualWindowUpdateHandler) {
+                this.activeManualWindow.removeListener('updateSlot', this.manualWindowUpdateHandler);
+            }
+            this.activeManualWindow = null;
+            this.manualWindowUpdateHandler = null;
+            this.manualMapCache.clear();
+            this.publishManualWindowState();
+        });
+
         instance.on('spawn', () => {
             if (this.bot !== instance) return; 
 
@@ -536,11 +743,24 @@ export class BotClient extends EventEmitter {
 
             if (needsAuth) {
                 this.log('Waiting for AutoAuth to complete before starting plugins...', 'info');
-                this.once('authCompleted', () => {
+                const startPlugins = (reason) => {
                     if (this.bot !== instance) return;
-                    this.log('AutoAuth complete! Starting plugins.', 'success');
+                    this.log(reason, 'success');
                     this.pluginManager.onBotSpawn();
+                };
+                this.once('authCompleted', () => {
+                    // Cancel the safety net, otherwise the plugins get started a
+                    // second time once it fires.
+                    clearTimeout(authGuard);
+                    startPlugins('AutoAuth complete! Starting plugins.');
                 });
+                // Safety net: a stuck auth flow must not keep the plugins dead
+                // for the whole session.
+                const authGuard = setTimeout(
+                    () => startPlugins('AutoAuth timed out after 15s. Starting plugins anyway.'),
+                    15_000
+                );
+                authGuard.unref?.();
             } else {
                 this.pluginManager.onBotSpawn();
             }

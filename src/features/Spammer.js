@@ -48,6 +48,14 @@ export class Spammer extends BaseFeature {
         this.botClient.log('Spammer stopped', 'warning');
     }
 
+    dispose() {
+        if (this.intervalId) {
+            clearInterval(this.intervalId);
+            this.intervalId = null;
+        }
+        this.config.enabled = false;
+    }
+
     setConfig(config) {
         const oldDelay = this.config.delay;
         const oldEnabled = this.config.enabled;

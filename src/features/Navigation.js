@@ -129,6 +129,10 @@ export class Navigation extends BaseFeature {
         this.targetPos = null;
     }
 
+    dispose() {
+        this.stop(true);
+    }
+
     follow(target) {
         if (!target || !target.position) return;
         this.targetPos = target.position;

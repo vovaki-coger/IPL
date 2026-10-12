@@ -1,6 +1,7 @@
-const socket = io();
+﻿const socket = io();
 
 let currentBot = null;
+let currentManualWindowId = null;
 let currentTab = 'controls';
 let bots = new Map();
 let activeKeys = new Set();
@@ -10,9 +11,87 @@ let chatVisible = true;
 let watchlist = [];
 let isCloudMode = false;
 const step = 3;
+const manualCaptchaPanel = document.getElementById('manualCaptchaPanel');
+const manualCaptchaTitle = document.getElementById('manualCaptchaTitle');
+const manualCaptchaMaps = document.getElementById('manualCaptchaMaps');
+const manualCaptchaSlots = document.getElementById('manualCaptchaSlots');
+const manualCaptchaHelp = document.getElementById('manualCaptchaHelp');
+const mapPaneStage = document.getElementById('mapPaneStage');
+const mapPaneZoom = document.getElementById('mapPaneZoom');
+const mapPaneZoomValue = document.getElementById('mapPaneZoomValue');
+const mapPaneCoords = document.getElementById('mapPaneCoords');
+const mapPaneBadge = document.getElementById('mapPaneBadge');
+const mapPaneCols = document.getElementById('mapPaneCols');
+const mapPaneAssemble = document.getElementById('mapPaneAssemble');
+const mapPaneRotateAll = document.getElementById('mapPaneRotateAll');
+const mapPaneSave = document.getElementById('mapPaneSave');
+let latestMapData = {};
+let activeMapId = null;
+let mapPartRotations = {};
+let mapWholeRotation = 0;
+let latestManualWindow = null;
+let mapSelectedCell = null;
+let currentMapCanvas = null;
+// Object.keys() sorts integer-like keys numerically, so the real arrival order
+// has to be remembered separately or the parts get laid out scrambled.
+let mapArrivalOrder = [];
+
+function noteMapArrival(maps) {
+    if (!maps || Object.keys(maps).length === 0) {
+        mapArrivalOrder = [];
+        return;
+    }
+    for (const id of Object.keys(maps)) {
+        if (maps[id] && !mapArrivalOrder.includes(id)) mapArrivalOrder.push(id);
+    }
+}
+
+// Slot order in the captcha window is the layout the server intends; anything
+// missing from it is appended in arrival order.
+function orderedMapIds(window) {
+    const ids = [];
+    for (const item of (window?.slots || [])) {
+        if (item && item.mapId !== null && item.mapId !== undefined) {
+            const id = String(item.mapId);
+            if (!ids.includes(id) && latestMapData[id]) ids.push(id);
+        }
+    }
+    for (const id of mapArrivalOrder) {
+        if (!ids.includes(id) && latestMapData[id]) ids.push(id);
+    }
+    return ids;
+}
+const MANUAL_MAP_PALETTE = [
+    0x000000, 0x7FB238, 0xF7E9A3, 0xC7C7C7, 0xFF0000, 0xA0A0FF, 0xA7A7A7, 0x007C00,
+    0xFFFFFF, 0xA4A8B8, 0x976D4D, 0x707070, 0x4040FF, 0x8F7748, 0xFFFCF5, 0xD87F33,
+    0xB24CD8, 0x6699D8, 0xE5E533, 0x7FCC19, 0xF27FA5, 0x4C4C4C, 0x999999, 0x4C7F99,
+    0x7F3FB2, 0x334CB2, 0x664C33, 0x667F33, 0x993333, 0x191919, 0xFAEE4D, 0x5CDBD5,
+    0x4A80FF, 0x00D93A, 0x815631, 0x700200, 0xD1B1A1, 0x9F5224, 0x95576C, 0x706C8A,
+    0xBA8524, 0x677535, 0xA04D4E, 0x392923, 0x876B62, 0x575C5C, 0x7A4958, 0x4C3E5C,
+    0x4C3223, 0x4C522A, 0x8E3C2E, 0x251610, 0xBD3031, 0x943F61, 0x5C191D, 0x167E86,
+    0x3A8E8C, 0x562C3E, 0x14B485, 0x646464, 0xD8AF93, 0x7FA796, 0xA2A2A2, 0xB8B8B8
+];
 
 
 const chatToggleBtn = document.getElementById('chatToggleBtn');
+if (manualCaptchaSlots) {
+    manualCaptchaSlots.addEventListener('click', (event) => {
+        const slotButton = event.target instanceof Element
+            ? event.target.closest('[data-captcha-slot]')
+            : null;
+        if (!slotButton || !currentBot) return;
+        socket.emit('botAction', {
+            username: currentBot,
+            action: 'captchaWindowClick',
+            payload: {
+                windowId: Number(slotButton.dataset.windowId),
+                slot: Number(slotButton.dataset.captchaSlot),
+                button: 0
+            }
+        });
+    });
+}
+
 if (chatToggleBtn) {
     chatToggleBtn.onclick = () => {
         chatVisible = !chatVisible;
@@ -177,9 +256,11 @@ function showNotification(message, type = 'info') {
 }
 
 socket.on('connect', () => {
-    connectionStatus.style.background = '#22c55e';
-    connectionStatus.title = 'Connected to Server';
-    loadingOverlay.classList.remove('active');
+    if (connectionStatus) {
+        connectionStatus.style.background = '#22c55e';
+        connectionStatus.title = 'Connected to Server';
+    }
+    if (loadingOverlay) loadingOverlay.classList.remove('active');
 });
 
 window.toggleDiscordFields = (val, prefix = '') => {
@@ -195,9 +276,11 @@ window.toggleDiscordFields = (val, prefix = '') => {
 };
 
 socket.on('disconnect', () => {
-    connectionStatus.style.background = '#ef4444';
-    connectionStatus.title = 'Disconnected';
-    loadingOverlay.classList.add('active');
+    if (connectionStatus) {
+        connectionStatus.style.background = '#ef4444';
+        connectionStatus.title = 'Disconnected';
+    }
+    if (loadingOverlay) loadingOverlay.classList.add('active');
 });
 
 let selectedBots = new Set();
@@ -232,7 +315,10 @@ socket.on('botList', (data) => {
             }
         };
 
-        const statusClass = bot.status === 'online' ? 'online' : (bot.status === 'offline' ? 'offline' : 'connecting');
+        const normalizedStatus = String(bot.status || '').toLowerCase();
+        const statusClass = normalizedStatus === 'online'
+            ? 'online'
+            : (normalizedStatus === 'offline' || normalizedStatus === 'disconnected' ? 'offline' : 'connecting');
 
         item.innerHTML = '';
 
@@ -403,7 +489,7 @@ function formatMinecraftText(text) {
     let currentStyle = '';
     let currentColor = '';
 
-    const parts = text.split(/§([0-9a-fk-or])/g);
+    const parts = text.split(/В§([0-9a-fk-or])/g);
 
     if (parts[0]) {
         html += escapeHtml(parts[0]);
@@ -850,7 +936,42 @@ window.openPluginSettings = (name, settingsJson, configJson) => {
 
         const labelText = schema.label || key;
 
-        if (schema.type === 'boolean') {
+        if (schema.type === 'select') {
+            const label = document.createElement('label');
+            label.innerText = labelText;
+            label.style.marginBottom = '8px';
+            label.style.display = 'block';
+            label.style.fontSize = '0.85rem';
+            label.style.color = 'var(--text-muted)';
+            group.appendChild(label);
+
+            const select = document.createElement('select');
+            select.name = key;
+            const options = Array.isArray(schema.options) ? schema.options : [];
+            // A value that no longer exists must still be visible, otherwise the
+            // saved setting silently resets to the first option.
+            const known = options.some(option => String(option.value) === String(val));
+            if (!known && val !== undefined && val !== null && val !== '') {
+                const legacy = document.createElement('option');
+                legacy.value = val;
+                legacy.textContent = `${val} (нет в списке)`;
+                select.appendChild(legacy);
+            }
+            for (const option of options) {
+                const node = document.createElement('option');
+                node.value = option.value;
+                node.textContent = option.label ?? option.value;
+                select.appendChild(node);
+            }
+            select.value = val;
+            select.style.width = '100%';
+            select.style.padding = '8px';
+            select.style.background = 'rgba(0,0,0,0.2)';
+            select.style.border = '1px solid var(--glass-border)';
+            select.style.color = 'var(--text-main)';
+            select.style.borderRadius = '6px';
+            group.appendChild(select);
+        } else if (schema.type === 'boolean') {
             const row = document.createElement('div');
             row.style.display = 'flex';
             row.style.justifyContent = 'space-between';
@@ -919,7 +1040,9 @@ if (pluginSettingsForm) {
         const config = {};
 
         const container = document.getElementById('pluginSettingsContainer');
-        container.querySelectorAll('input').forEach(input => {
+        // <select> is included because plugin settings can be dropdowns now, and the
+        // old input-only query silently dropped them on save.
+        container.querySelectorAll('input, select').forEach(input => {
             if (input.type === 'checkbox') {
                 config[input.name] = input.checked;
             } else if (input.type === 'number') {
@@ -947,6 +1070,10 @@ socket.on('notification', (data) => {
 
 function selectBot(username) {
     currentBot = username;
+    currentManualWindowId = null;
+    if (manualCaptchaPanel) manualCaptchaPanel.hidden = true;
+    if (manualCaptchaMaps) manualCaptchaMaps.replaceChildren();
+    if (manualCaptchaSlots) manualCaptchaSlots.replaceChildren();
     lastSpammerConfigStr = '';
 
     // Emit selection to server to join specific room
@@ -994,6 +1121,7 @@ function selectBot(username) {
     if (botNameHeader) botNameHeader.innerText = username;
 
     socket.emit('requestBotData', { username });
+    socket.emit('requestManualWindow', username);
     socket.emit('requestAnalyticsHistory', { username });
 
     const resetBtn = (btn, label) => {
@@ -1022,7 +1150,7 @@ function updateInventoryFrame() {
     const isOnline = status === 'online' || status.includes('error');
 
     if (bot && isOnline && bot.inventoryPort) {
-        let url = isCloudMode ? `/inventory/${bot.inventoryPort}` : `http://${window.location.hostname}:${bot.inventoryPort}`;
+        const url = `/inventory/${bot.inventoryPort}/`;
         if (iframe.src !== url) iframe.src = url;
         iframe.style.display = 'block';
         placeholder.style.display = 'none';
@@ -1040,20 +1168,506 @@ function updateInventoryFrame() {
     }
 }
 
+/* Mini browser integration: prefer Socket.io events and fall back to the HTTP endpoint
+   when the running server does not expose the browser events. */
+const browserForm = document.getElementById('browserForm');
+const browserUrl = document.getElementById('browserUrl');
+const browserProfile = document.getElementById('browserProfile');
+const browserOpenBtn = document.getElementById('browserOpenBtn');
+const browserSession = document.getElementById('browserSession');
+const browserSessionText = document.getElementById('browserSessionText');
+const browserError = document.getElementById('browserError');
+const browserViewport = document.getElementById('browserViewport');
+const browserFrame = document.getElementById('browserFrame');
+const browserToolbar = document.getElementById('browserToolbar');
+const browserBack = document.getElementById('browserBack');
+const browserForward = document.getElementById('browserForward');
+const browserReload = document.getElementById('browserReload');
+let browserSessionEndsAt = 0;
+let browserSessionTimer = null;
+let browserScreenTimer = null;
+let browserFallbackTimer = null;
+let browserRequestId = 0;
+let browserProfilesInitialized = false;
+let browserSessionId = null;
+let browserSessionUsesEngine = false;
+let browserScreen = null;
+let browserScreenBusy = false;
+let browserScreenObjectUrl = null;
+let browserSessionProfile = '';
+
+function setBrowserState(state, text) {
+    if (!browserSession || !browserSessionText) return;
+    browserSession.dataset.state = state;
+    browserSessionText.innerText = text;
+}
+
+function setBrowserError(message = '') {
+    if (!browserError) return;
+    browserError.innerText = message;
+}
+
+function clearBrowserSessionView() {
+    stopBrowserScreenTimer();
+    stopBrowserSessionTimer();
+    browserSessionId = null;
+    browserSessionUsesEngine = false;
+    if (browserViewport) browserViewport.hidden = true;
+    if (browserToolbar) browserToolbar.hidden = true;
+    if (browserFrame) browserFrame.src = 'about:blank';
+    setBrowserState('idle', 'Session expired');
+}
+
+function stopBrowserSessionTimer() {
+    if (browserSessionTimer) {
+        clearInterval(browserSessionTimer);
+        browserSessionTimer = null;
+    }
+}
+
+function stopBrowserScreenTimer() {
+    if (browserScreenTimer) {
+        clearInterval(browserScreenTimer);
+        browserScreenTimer = null;
+    }
+    browserScreenBusy = false;
+}
+
+function getBrowserSessionUrl(payload = {}) {
+    const sessionPayload = payload && (payload.session || payload.data) || payload;
+    return sessionPayload?.url || sessionPayload?.sessionUrl || sessionPayload?.session_url || '';
+}
+
+function browserSessionIdFromUrl(sessionUrl) {
+    try {
+        const pathname = new URL(sessionUrl, window.location.origin).pathname;
+        const match = pathname.match(/\/browser\/session\/([^/]+)/);
+        return match ? decodeURIComponent(match[1]) : null;
+    } catch {
+        return null;
+    }
+}
+
+function setBrowserSessionAddress(url) {
+    if (!browserUrl || document.activeElement === browserUrl || !url) return;
+    if (/^https?:\/\//i.test(url)) browserUrl.value = url;
+}
+
+async function refreshBrowserScreen() {
+    if (!browserSessionId || !browserScreen || browserScreenBusy) return;
+    browserScreenBusy = true;
+    try {
+        const response = await fetch(
+            `/browser/session/${encodeURIComponent(browserSessionId)}/screenshot?t=${Date.now()}`,
+            { cache: 'no-store', credentials: 'include' }
+        );
+        if (!response.ok) {
+            const detail = await response.json().catch(() => ({}));
+            throw new Error(detail.error || `Screen update failed (${response.status})`);
+        }
+        const imageBlob = await response.blob();
+        const nextObjectUrl = URL.createObjectURL(imageBlob);
+        const previousObjectUrl = browserScreenObjectUrl;
+        browserScreen.onload = () => {
+            if (previousObjectUrl) URL.revokeObjectURL(previousObjectUrl);
+        };
+        browserScreen.src = nextObjectUrl;
+        browserScreenObjectUrl = nextObjectUrl;
+    } catch (error) {
+        if (browserSession && browserSession.dataset.state === 'active') {
+            setBrowserError(error.message || 'Could not update the browser screen.');
+        }
+    } finally {
+        browserScreenBusy = false;
+    }
+}
+
+async function sendBrowserAction(action, detail = {}) {
+    // Silently returning here is what made the toolbar buttons feel dead:
+    // nothing was sent, nothing was said, nothing changed on screen.
+    if (!browserSessionId || !browserSessionUsesEngine) {
+        setBrowserError('No active browser session. Re-open it from the bot panel.');
+        return;
+    }
+    try {
+        const response = await fetch(
+            `/browser/session/${encodeURIComponent(browserSessionId)}/action`,
+            {
+                method: 'POST',
+                credentials: 'include',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ action, ...detail })
+            }
+        );
+        const result = await response.json().catch(() => ({}));
+        if (response.status === 410) {
+            // The session is gone server side. Say so and drop the dead
+            // panel, otherwise every button keeps failing with no reason.
+            setBrowserError('Browser session expired. Re-open it from the bot panel.');
+            clearBrowserSessionView();
+            return;
+        }
+        if (!response.ok) throw new Error(result.error || `Browser action failed (${response.status})`);
+        setBrowserSessionAddress(result.url);
+        if (result.expiresAt) browserSessionEndsAt = Number(result.expiresAt);
+        setBrowserError('');
+        await refreshBrowserScreen();
+    } catch (error) {
+        setBrowserError(error.message || 'Browser action failed.');
+    }
+}
+
+async function navigateBrowserSession(url) {
+    if (!browserSessionId || !browserSessionUsesEngine) return false;
+    try {
+        const response = await fetch(
+            `/browser/session/${encodeURIComponent(browserSessionId)}/navigate`,
+            {
+                method: 'POST',
+                credentials: 'include',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ url })
+            }
+        );
+        const result = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(result.error || `Navigation failed (${response.status})`);
+        setBrowserSessionAddress(result.url || url);
+        if (result.expiresAt) browserSessionEndsAt = Number(result.expiresAt);
+        setBrowserError('');
+        await refreshBrowserScreen();
+        return true;
+    } catch (error) {
+        setBrowserError(error.message || 'Navigation failed.');
+        return false;
+    }
+}
+
+function installBrowserScreenInteractions() {
+    if (!browserViewport || !browserScreen) return;
+    browserViewport.tabIndex = 0;
+    browserViewport.dataset.interactive = 'true';
+
+    browserScreen.addEventListener('click', event => {
+        const bounds = browserScreen.getBoundingClientRect();
+        if (!bounds.width || !bounds.height) return;
+        const scaleX = browserScreen.naturalWidth / bounds.width;
+        const scaleY = browserScreen.naturalHeight / bounds.height;
+        browserViewport.focus({ preventScroll: true });
+        sendBrowserAction('click', {
+            x: Math.round((event.clientX - bounds.left) * scaleX),
+            y: Math.round((event.clientY - bounds.top) * scaleY)
+        });
+    });
+
+    browserScreen.addEventListener('wheel', event => {
+        event.preventDefault();
+        sendBrowserAction('scroll', {
+            deltaX: Math.round(event.deltaX),
+            deltaY: Math.round(event.deltaY)
+        });
+    }, { passive: false });
+
+    browserViewport.onkeydown = event => {
+        if (event.altKey || event.metaKey) return;
+        let keyName = '';
+        if (event.ctrlKey && event.key.toLowerCase() === 'a') keyName = 'CTRL+A';
+        else if (event.key.length === 1 && !event.ctrlKey) {
+            event.preventDefault();
+            sendBrowserAction('type', { text: event.key });
+            return;
+        } else {
+            const keys = {
+                Enter: 'ENTER',
+                Tab: 'TAB',
+                Escape: 'ESCAPE',
+                Backspace: 'BACKSPACE',
+                Delete: 'DELETE',
+                ArrowUp: 'ARROWUP',
+                ArrowDown: 'ARROWDOWN',
+                ArrowLeft: 'ARROWLEFT',
+                ArrowRight: 'ARROWRIGHT',
+                ' ': 'SPACE',
+                Home: 'HOME',
+                End: 'END',
+                PageUp: 'PAGEUP',
+                PageDown: 'PAGEDOWN'
+            };
+            keyName = keys[event.key] || '';
+        }
+        if (keyName) {
+            event.preventDefault();
+            sendBrowserAction('key', { key: keyName });
+        }
+    };
+}
+
+async function refreshBrowserAddress() {
+    if (!browserSessionId || !browserSessionUsesEngine) return;
+    try {
+        const response = await fetch(
+            `/browser/session/${encodeURIComponent(browserSessionId)}/state`,
+            { cache: 'no-store', credentials: 'include' }
+        );
+        if (!response.ok) return;
+        const state = await response.json();
+        setBrowserSessionAddress(state.url);
+        if (state.expiresAt) browserSessionEndsAt = Number(state.expiresAt);
+    } catch {
+        // The next state poll or the screenshot request will surface a session error.
+    }
+}
+
+function startBrowserSession(expiresAt, sessionUrl = '', usesEngine = false, currentUrl = '') {
+    const parsedExpiry = Number(expiresAt);
+    browserSessionEndsAt = Number.isFinite(parsedExpiry) && parsedExpiry > Date.now()
+        ? parsedExpiry
+        : Date.now() + 300000;
+
+    browserSessionId = browserSessionIdFromUrl(sessionUrl);
+    browserSessionUsesEngine = Boolean(usesEngine && browserSessionId);
+    browserSessionProfile = browserProfile ? browserProfile.value : '';
+    setBrowserSessionAddress(currentUrl);
+    if (browserViewport) browserViewport.hidden = !sessionUrl;
+    stopBrowserScreenTimer();
+
+    if (browserSessionUsesEngine && browserViewport) {
+        browserScreen = document.createElement('img');
+        browserScreen.className = 'browser-screen';
+        browserScreen.alt = 'Interactive Mini Browser screen. Click to interact, then type or use the arrow keys.';
+        browserScreen.draggable = false;
+        browserViewport.replaceChildren(browserScreen);
+        if (browserToolbar) browserToolbar.hidden = false;
+        installBrowserScreenInteractions();
+        refreshBrowserScreen();
+        let browserAddressTicks = 0;
+        browserScreenTimer = setInterval(() => {
+            refreshBrowserScreen();
+            // The address changes only on navigation, but every poll for it
+            // queues behind the screenshot on the driver's lock and makes the
+            // whole engine feel slower. Once every 4th tick is plenty.
+            if (++browserAddressTicks % 4 === 0) refreshBrowserAddress();
+        }, 2000);
+    } else if (sessionUrl && browserViewport) {
+        if (browserToolbar) browserToolbar.hidden = true;
+        browserScreen = null;
+        browserViewport.dataset.interactive = 'false';
+        const frame = document.createElement('iframe');
+        frame.src = new URL(sessionUrl, window.location.origin).href;
+        frame.title = 'Server browser';
+        frame.referrerPolicy = 'no-referrer';
+        browserViewport.replaceChildren(frame);
+    }
+
+    stopBrowserSessionTimer();
+    const renderRemaining = () => {
+        const remaining = Math.max(0, browserSessionEndsAt - Date.now());
+        if (remaining === 0) {
+            stopBrowserSessionTimer();
+            stopBrowserScreenTimer();
+            setBrowserState('idle', 'Session expired');
+            if (browserFrame) browserFrame.src = 'about:blank';
+            if (browserScreenObjectUrl) URL.revokeObjectURL(browserScreenObjectUrl);
+            browserScreenObjectUrl = null;
+            browserSessionId = null;
+            browserSessionUsesEngine = false;
+            if (browserToolbar) browserToolbar.hidden = true;
+            if (browserViewport) browserViewport.hidden = true;
+            return;
+        }
+        const totalSeconds = Math.ceil(remaining / 1000);
+        const minutes = String(Math.floor(totalSeconds / 60)).padStart(2, '0');
+        const seconds = String(totalSeconds % 60).padStart(2, '0');
+        setBrowserState('active', `Session active В· ${minutes}:${seconds}`);
+    };
+
+    renderRemaining();
+    browserSessionTimer = setInterval(renderRemaining, 1000);
+}
+
+function normalizeBrowserExpiry(payload) {
+    const sessionPayload = payload && (payload.session || payload.data) || payload;
+    if (!sessionPayload) return Date.now() + 300000;
+    if (sessionPayload.expiresAt || sessionPayload.expires_at) {
+        const raw = sessionPayload.expiresAt || sessionPayload.expires_at;
+        const timestamp = typeof raw === 'string' && Number.isNaN(Number(raw))
+            ? Date.parse(raw)
+            : Number(raw);
+        return timestamp > 100000000000 ? timestamp : Date.now() + timestamp * 1000;
+    }
+    const duration = Number(sessionPayload.expiresIn || sessionPayload.expires_in || sessionPayload.ttl || sessionPayload.duration);
+    return Number.isFinite(duration) && duration > 0 ? Date.now() + duration * 1000 : Date.now() + 300000;
+}
+
+function handleBrowserStatus(payload = {}) {
+    if (browserFallbackTimer) {
+        clearTimeout(browserFallbackTimer);
+        browserFallbackTimer = null;
+    }
+
+    const status = String(payload.status || payload.state || (payload.error ? 'error' : 'active')).toLowerCase();
+    const errorMessage = payload.error || (payload.message && ['error', 'failed', 'offline'].includes(status) ? payload.message : '');
+
+    if (errorMessage || ['error', 'failed', 'offline'].includes(status)) {
+        browserOpenBtn.disabled = false;
+        setBrowserState('error', 'Session unavailable');
+        setBrowserError(String(errorMessage || 'The browser session could not be opened.'));
+        return;
+    }
+
+    if (['opening', 'pending', 'connecting'].includes(status)) {
+        setBrowserState('opening', 'Opening session');
+        return;
+    }
+
+    browserOpenBtn.disabled = false;
+    setBrowserError('');
+    startBrowserSession(
+        normalizeBrowserExpiry(payload),
+        getBrowserSessionUrl(payload),
+        Boolean(payload.engine),
+        payload.currentUrl
+    );
+}
+
+function browserPayload() {
+    const profile = browserProfile ? browserProfile.value : '';
+    const rawUrl = browserUrl ? browserUrl.value.trim() : '';
+    const normalizedUrl = rawUrl && /^[a-z][a-z\d+\-.]*:\/\//i.test(rawUrl)
+        ? rawUrl
+        : rawUrl
+            ? `https://${rawUrl}`
+            : '';
+    return {
+        url: normalizedUrl,
+        profile: profile || currentBot || null,
+        username: profile || currentBot || null
+    };
+}
+
+async function openBrowserOverHttp(payload, requestId) {
+    try {
+        const response = await fetch('/browser/open', {
+            method: 'POST',
+            credentials: 'include',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+        let result = {};
+        try {
+            result = await response.json();
+        } catch (error) {
+            result = {};
+        }
+        if (requestId !== browserRequestId) return;
+        if (!response.ok) {
+            throw new Error(result.error || result.message || `Browser request failed (${response.status})`);
+        }
+        handleBrowserStatus(result);
+    } catch (error) {
+        if (requestId !== browserRequestId) return;
+        browserOpenBtn.disabled = false;
+        setBrowserState('error', 'Session unavailable');
+        setBrowserError(error.message || 'The browser session could not be opened.');
+    }
+}
+
+function renderBrowserProfiles() {
+    if (!browserProfile) return;
+    const selectedValue = browserProfile.value || currentBot || '';
+    browserProfile.innerHTML = '';
+
+    const autoOption = document.createElement('option');
+    autoOption.value = '';
+    autoOption.innerText = currentBot ? `Current: ${currentBot}` : 'Current bot / proxy';
+    browserProfile.appendChild(autoOption);
+
+    bots.forEach((bot, username) => {
+        const option = document.createElement('option');
+        option.value = username;
+        const proxy = bot.proxy || bot.config && bot.config.proxy;
+        option.innerText = proxy ? `${username} В· proxy` : username;
+        browserProfile.appendChild(option);
+    });
+
+    browserProfile.value = [...browserProfile.options].some(option => option.value === selectedValue)
+        ? selectedValue
+        : '';
+    browserProfilesInitialized = true;
+}
+
+if (browserForm) {
+    browserForm.addEventListener('submit', (event) => {
+        event.preventDefault();
+        const payload = browserPayload();
+        if (!payload.url) return;
+
+        if (browserSessionUsesEngine &&
+            browserSessionId &&
+            browserSessionProfile === (browserProfile ? browserProfile.value : '')) {
+            browserOpenBtn.disabled = true;
+            setBrowserState('opening', 'Navigating');
+            navigateBrowserSession(payload.url).then(success => {
+                browserOpenBtn.disabled = false;
+                setBrowserState(success ? 'active' : 'error', success ? 'Session active' : 'Navigation failed');
+            });
+            return;
+        }
+
+        browserRequestId += 1;
+        const requestId = browserRequestId;
+        if (browserFallbackTimer) clearTimeout(browserFallbackTimer);
+        browserOpenBtn.disabled = true;
+        setBrowserError('');
+        setBrowserState('opening', 'Opening session');
+
+        const fallbackToHttp = () => {
+            if (requestId !== browserRequestId) return;
+            openBrowserOverHttp(payload, requestId);
+        };
+
+        // Browser sessions are HTTP server routes. Use them directly instead
+        // of waiting for an optional Socket.IO handler that may not exist in
+        // older/published server processes.
+        fallbackToHttp();
+    });
+}
+
+browserBack?.addEventListener('click', () => sendBrowserAction('back'));
+browserForward?.addEventListener('click', () => sendBrowserAction('forward'));
+browserReload?.addEventListener('click', () => sendBrowserAction('reload'));
+
+socket.on('browserOpen', handleBrowserStatus);
+socket.on('browserStatus', handleBrowserStatus);
+socket.on('botList', renderBrowserProfiles);
+
+if (browserProfile) {
+    browserProfile.addEventListener('change', () => {
+        if (!browserProfilesInitialized) renderBrowserProfiles();
+    });
+}
+
 function updateViewer(port) {
     if (!port) return;
     const viewerFrame = viewerContainer.querySelector('iframe');
-    let newSrc;
-    if (isCloudMode) {
-        newSrc = `/viewer/${port}`;
-    } else {
-        newSrc = `http://${window.location.hostname}:${port}`;
-    }
+    const newSrc = `/viewer/${port}/`;
     if (!viewerFrame) {
-        viewerContainer.innerHTML = `<iframe src="${newSrc}" style="width:100%; height:100%; border:none;"></iframe>`;
-    } else if (viewerFrame.src !== newSrc) {
+        const frame = document.createElement('iframe');
+        frame.src = newSrc;
+        frame.dataset.viewerSrc = newSrc;
+        frame.title = 'Minecraft visual feed';
+        frame.loading = 'eager';
+        frame.style.cssText = 'width:100%; height:100%; border:none;';
+        frame.addEventListener('error', () => {
+            viewerContainer.innerHTML = '<div class="placeholder">Viewer connection failed</div>';
+        });
+        viewerContainer.replaceChildren(frame);
+    } else if (viewerFrame.dataset.viewerSrc !== newSrc) {
+        viewerFrame.dataset.viewerSrc = newSrc;
         viewerFrame.src = newSrc;
     }
+
+    const portDisplay = document.getElementById('viewerPortDisplay');
+    if (portDisplay) portDisplay.innerText = `:${port}`;
 }
 
 socket.on('botViewer', (data) => {
@@ -1071,6 +1685,483 @@ socket.on('botViewer', (data) => {
             viewModeBtn.innerText = data.firstPerson ? 'Third Person' : 'First Person';
         }
     }
+});
+
+// The bot is headless, so there is no screen to screenshot. This asks the
+// server to draw the loaded block data around the bot as a top-down map.
+let snapshotObjectUrl = null;
+const snapshotBtn = document.getElementById('snapshotBtn');
+const snapshotInfo = document.getElementById('snapshotInfo');
+const snapshotResult = document.getElementById('snapshotResult');
+const snapshotImg = document.getElementById('snapshotImg');
+
+snapshotBtn?.addEventListener('click', async () => {
+    if (!currentBot) {
+        snapshotInfo.innerText = 'Сначала выбери бота';
+        return;
+    }
+    snapshotBtn.disabled = true;
+    snapshotInfo.innerText = 'Рисую...';
+    try {
+        const response = await fetch(`/snapshot?bot=${encodeURIComponent(currentBot)}&t=${Date.now()}`);
+        if (!response.ok) {
+            const body = await response.json().catch(() => ({}));
+            throw new Error(body.error || `HTTP ${response.status}`);
+        }
+        const metaHeader = response.headers.get('X-Snapshot');
+        const blob = await response.blob();
+        if (snapshotObjectUrl) URL.revokeObjectURL(snapshotObjectUrl);
+        snapshotObjectUrl = URL.createObjectURL(blob);
+        snapshotImg.src = snapshotObjectUrl;
+        snapshotResult.hidden = false;
+        if (metaHeader) {
+            const meta = JSON.parse(metaHeader);
+            snapshotInfo.innerText = `x ${meta.x} y ${meta.y} z ${meta.z} · ${meta.unloaded} незагруженных`;
+        } else {
+            snapshotInfo.innerText = '';
+        }
+    } catch (err) {
+        snapshotInfo.innerText = err.message;
+    } finally {
+        snapshotBtn.disabled = false;
+    }
+});
+
+function decodeManualMap(encodedPixels) {
+    try {
+        const binary = atob(encodedPixels);
+        if (binary.length < 128 * 128) return null;
+        const pixels = new Uint8ClampedArray(128 * 128 * 4);
+        const shades = [0.71, 0.86, 1, 0.53];
+
+        for (let index = 0; index < 128 * 128; index += 1) {
+            const packedColor = binary.charCodeAt(index);
+            const output = index * 4;
+            // Palette index 0 is Minecraft's CLEAR colour, so byte 0 really
+            // is "no data" and must stay transparent.
+            if (packedColor === 0) {
+                pixels[output + 3] = 0;
+                continue;
+            }
+            const baseIndex = packedColor >> 2;
+            const rgb = MANUAL_MAP_PALETTE[baseIndex] || 0x909090;
+            const brightness = shades[packedColor & 3];
+            pixels[output] = Math.min(255, Math.round(((rgb >> 16) & 0xff) * brightness));
+            pixels[output + 1] = Math.min(255, Math.round(((rgb >> 8) & 0xff) * brightness));
+            pixels[output + 2] = Math.min(255, Math.round((rgb & 0xff) * brightness));
+            pixels[output + 3] = 255;
+        }
+
+        return new ImageData(pixels, 128, 128);
+    } catch (error) {
+        console.warn('Could not decode the server map image:', error);
+        return null;
+    }
+}
+
+function drawManualMap(canvas, encodedPixels) {
+    const image = decodeManualMap(encodedPixels);
+    if (!image) return false;
+    const context = canvas.getContext('2d');
+    if (!context) return false;
+    context.imageSmoothingEnabled = false;
+    context.putImageData(image, 0, 0);
+    return true;
+}
+
+function mapWord(count) {
+    const mod10 = count % 10;
+    const mod100 = count % 100;
+    if (mod10 === 1 && mod100 !== 11) return 'карта';
+    if (mod10 >= 2 && mod10 <= 4 && (mod100 < 10 || mod100 >= 20)) return 'карты';
+    return 'карт';
+}
+
+// Captcha maps arrive as ONE picture cut into 128x128 tiles and shuffled.
+// Measured on real server samples: a correct seam costs ~4/765 while wrong
+// pairs sit near 274, so growing the grid from the best seam is reliable.
+function mapBorderCost(inner, outer, vertical) {
+    let sum = 0;
+    let counted = 0;
+    for (let i = 0; i < 128; i += 1) {
+        const a = vertical ? ((127 * 128 + i) * 4) : ((i * 128 + 127) * 4);
+        const b = vertical ? (i * 4) : ((i * 128) * 4);
+        if (inner[a + 3] < 8 || outer[b + 3] < 8) continue;
+        sum += Math.abs(inner[a] - outer[b]) +
+            Math.abs(inner[a + 1] - outer[b + 1]) +
+            Math.abs(inner[a + 2] - outer[b + 2]);
+        counted += 1;
+    }
+    return counted ? sum / counted : 765;
+}
+
+function assembleCaptchaPuzzle(ids) {
+    const pieces = [];
+    for (const id of ids) {
+        const image = decodeManualMap(latestMapData[id]);
+        if (image) pieces.push({ id, px: image.data });
+    }
+    if (pieces.length < 2) return null;
+
+    const total = pieces.length;
+    const cols = Math.round(Math.sqrt(total));
+    const rows = Math.ceil(total / cols);
+
+    let seed = null;
+    for (let a = 0; a < total; a += 1) {
+        for (let b = 0; b < total; b += 1) {
+            if (a === b) continue;
+            const c = mapBorderCost(pieces[a].px, pieces[b].px, false);
+            if (!seed || c < seed.cost) seed = { a, b, cost: c };
+        }
+    }
+    if (!seed) return null;
+
+    const grid = new Array(cols * rows).fill(null);
+    const used = new Set([seed.a, seed.b]);
+    grid[0] = pieces[seed.a];
+    grid[1] = pieces[seed.b];
+
+    for (let cell = 2; cell < cols * rows; cell += 1) {
+        const col = cell % cols;
+        const row = Math.floor(cell / cols);
+        const left = col > 0 ? grid[cell - 1] : null;
+        const above = row > 0 ? grid[cell - cols] : null;
+        if (!left && !above) break;
+
+        let best = null;
+        for (let i = 0; i < total; i += 1) {
+            if (used.has(i)) continue;
+            let cost = 0;
+            let parts = 0;
+            if (left) { cost += mapBorderCost(left.px, pieces[i].px, false); parts += 1; }
+            if (above) { cost += mapBorderCost(above.px, pieces[i].px, true); parts += 1; }
+            if (!parts) continue;
+            cost /= parts;
+            if (!best || cost < best.cost) best = { i, cost };
+        }
+        if (!best) break;
+        grid[cell] = pieces[best.i];
+        used.add(best.i);
+    }
+
+    return { grid, cols, rows, seedCost: seed.cost };
+}
+
+function drawCaptchaPuzzle(assembly) {
+    const out = document.createElement('canvas');
+    out.width = assembly.cols * 128;
+    out.height = Math.max(128, assembly.rows * 128);
+    const context = out.getContext('2d');
+    if (!context) return null;
+    context.imageSmoothingEnabled = false;
+
+    const part = document.createElement('canvas');
+    part.width = 128;
+    part.height = 128;
+    const partCtx = part.getContext('2d');
+
+    assembly.grid.forEach((cell, index) => {
+        if (!cell) return;
+        const image = partCtx.createImageData(128, 128);
+        image.data.set(cell.px);
+        partCtx.putImageData(image, 0, 0);
+        const originX = (index % assembly.cols) * 128;
+        const originY = Math.floor(index / assembly.cols) * 128;
+        context.drawImage(part, originX, originY);
+        context.strokeStyle = 'rgba(148,163,184,0.2)';
+        context.lineWidth = 1;
+        context.strokeRect(originX + 0.5, originY + 0.5, 127, 127);
+    });
+
+    return out;
+}
+
+function renderMapPane() {
+    if (!mapPaneStage) return;
+
+    const zoom = Number(mapPaneZoom?.value) || 1;
+    if (mapPaneZoomValue) mapPaneZoomValue.textContent = `${zoom}x`;
+
+    const ids = orderedMapIds(latestManualWindow);
+
+    if (!ids.length) {
+        if (mapPaneBadge) mapPaneBadge.textContent = 'Ожидание';
+        mapPaneStage.replaceChildren();
+        if (mapPaneCoords) mapPaneCoords.textContent = 'Карты пока нет';
+        renderMapOverlay();
+        return;
+    }
+
+    if (mapPaneBadge) mapPaneBadge.textContent = `${ids.length} ${mapWord(ids.length)}`;
+
+    // Put the shuffled tiles back into the original picture first.
+    const solved = mapPaneAssemble?.checked && ids.length > 1
+        ? assembleCaptchaPuzzle(ids)
+        : null;
+
+    if (solved) {
+        const picture = drawCaptchaPuzzle(solved);
+        if (picture) {
+            picture.className = 'map-pane-canvas';
+            picture.style.width = `${picture.width * zoom}px`;
+            picture.style.height = `${picture.height * zoom}px`;
+            picture.style.maxWidth = 'none';
+            picture.setAttribute('role', 'img');
+            picture.setAttribute('aria-label', 'Собранная картинка капчи');
+            mapPaneStage.replaceChildren(picture);
+            currentMapCanvas = picture;
+            if (mapPaneBadge) {
+                mapPaneBadge.textContent =
+                    `${solved.cols}×${solved.rows} · собрано из ${ids.length} ${mapWord(ids.length)}`;
+            }
+            if (mapPaneCoords) mapPaneCoords.textContent = 'Картинка собрана из перемешанных кусков';
+            renderMapOverlay();
+            return;
+        }
+    }
+
+    // Every map from this server is a piece of one picture, so show all of them
+    // at once, each at its full 128x128 size.
+    const chosen = mapPaneCols?.value ?? 'auto';
+    const available = Math.max(128, (mapPaneStage.clientWidth || 1024) - 18);
+    // "auto" packs as many full-size maps per row as the panel can hold.
+    const cols = chosen === 'auto'
+        ? Math.max(1, Math.min(ids.length, Math.floor(available / 128)))
+        : Math.max(1, Number(chosen) || 6);
+    const rows = Math.ceil(ids.length / cols);
+    const canvas = document.createElement('canvas');
+    canvas.width = cols * 128;
+    canvas.height = Math.max(128, rows * 128);
+    const context = canvas.getContext('2d');
+    if (!context) return;
+    context.imageSmoothingEnabled = false;
+
+    ids.forEach((id, index) => {
+        const image = decodeManualMap(latestMapData[id]);
+        if (!image) return;
+        const part = document.createElement('canvas');
+        part.width = 128;
+        part.height = 128;
+        part.getContext('2d').putImageData(image, 0, 0);
+
+        const originX = (index % cols) * 128;
+        const originY = Math.floor(index / cols) * 128;
+        const turn = (mapPartRotations[id] || 0) % 360;
+
+        context.save();
+        context.translate(originX + 64, originY + 64);
+        if (turn) context.rotate(turn * Math.PI / 180);
+        context.drawImage(part, -64, -64);
+        context.restore();
+
+        context.strokeStyle = index === mapSelectedCell ? '#facc15' : 'rgba(148,163,184,0.4)';
+        context.lineWidth = index === mapSelectedCell ? 3 : 1;
+        context.strokeRect(originX + 1, originY + 1, 126, 126);
+    });
+
+    canvas.className = 'map-pane-canvas';
+    canvas.style.width = `${canvas.width * zoom}px`;
+    canvas.style.height = `${canvas.height * zoom}px`;
+    canvas.style.maxWidth = 'none';
+    canvas.setAttribute('role', 'img');
+    canvas.setAttribute('aria-label', `Все карты: ${ids.length}`);
+
+    const cellAt = (event) => {
+        const rect = canvas.getBoundingClientRect();
+        const x = Math.floor((event.clientX - rect.left) / rect.width * canvas.width);
+        const y = Math.floor((event.clientY - rect.top) / rect.height * canvas.height);
+        if (x < 0 || y < 0 || x >= canvas.width || y >= canvas.height) return -1;
+        return Math.floor(y / 128) * cols + Math.floor(x / 128);
+    };
+
+    canvas.addEventListener('mousemove', (event) => {
+        const cell = cellAt(event);
+        if (cell < 0 || cell >= ids.length || !mapPaneCoords) return;
+        mapPaneCoords.textContent = `Карта #${ids[cell]} · ${cell + 1} из ${ids.length}`;
+    });
+
+    canvas.addEventListener('mouseleave', () => {
+        if (mapPaneCoords) mapPaneCoords.textContent = 'ПКМ по карте - повернуть её на 90°';
+    });
+
+    canvas.addEventListener('click', (event) => {
+        const cell = cellAt(event);
+        if (cell < 0 || cell >= ids.length) return;
+        mapSelectedCell = cell;
+        renderMapPane();
+    });
+
+    canvas.addEventListener('contextmenu', (event) => {
+        event.preventDefault();
+        const cell = cellAt(event);
+        if (cell < 0 || cell >= ids.length) return;
+        const id = ids[cell];
+        mapPartRotations[id] = ((mapPartRotations[id] || 0) + 90) % 360;
+        renderMapPane();
+    });
+
+    mapPaneStage.replaceChildren(canvas);
+    currentMapCanvas = canvas;
+    renderMapOverlay();
+}
+
+function renderMapOverlay() {
+    const overlay = document.getElementById('mapPaneOverlay');
+    const body = document.getElementById('mapPaneOverlayBody');
+    if (!overlay || !body || overlay.hidden) return;
+
+    body.replaceChildren();
+    if (!currentMapCanvas) {
+        const placeholder = document.createElement('div');
+        placeholder.className = 'placeholder';
+        placeholder.textContent = 'Карты пока нет';
+        body.appendChild(placeholder);
+        return;
+    }
+
+    const clone = document.createElement('canvas');
+    clone.width = currentMapCanvas.width;
+    clone.height = currentMapCanvas.height;
+    const context = clone.getContext('2d');
+    context.imageSmoothingEnabled = false;
+    context.drawImage(currentMapCanvas, 0, 0);
+    clone.className = 'map-pane-canvas map-pane-canvas-full';
+    body.appendChild(clone);
+
+    const hint = document.createElement('p');
+    hint.className = 'map-pane-help';
+    hint.textContent =
+        `${orderedMapIds(latestManualWindow).length} карт · ПКМ - повернуть · Esc - закрыть`;
+    body.appendChild(hint);
+}
+
+function renderManualWindowState(payload) {
+    if (!payload || payload.username !== currentBot) return;
+    const window = payload.window;
+    if (!manualCaptchaPanel || !manualCaptchaTitle || !manualCaptchaMaps ||
+        !manualCaptchaSlots || !manualCaptchaHelp) return;
+
+    const maps = payload.maps || {};
+    latestManualWindow = window || null;
+    noteMapArrival(maps);
+    latestMapData = maps;
+    renderMapPane();
+
+    if (!window && Object.keys(maps).length === 0) {
+        currentManualWindowId = null;
+        manualCaptchaPanel.hidden = true;
+        manualCaptchaMaps.replaceChildren();
+        manualCaptchaSlots.replaceChildren();
+        return;
+    }
+
+    currentManualWindowId = window?.id ?? null;
+    manualCaptchaPanel.hidden = false;
+    const occupiedSlots = (window?.slots || []).filter(Boolean).length;
+    manualCaptchaTitle.textContent = window
+        ? [
+            window.title || 'Server challenge',
+            window.type || '',
+            `${occupiedSlots} item${occupiedSlots === 1 ? '' : 's'}`
+        ].filter(Boolean).join(' В· ')
+        : 'Server map images В· enter your answer in chat';
+
+    manualCaptchaMaps.replaceChildren();
+    const mapIds = new Set(Object.keys(maps).map(String));
+    for (const item of (window?.slots || [])
+            .filter(item => item && item.mapId !== null && item.mapId !== undefined)
+            .map(item => String(item.mapId))) {
+        mapIds.add(item);
+    }
+    for (const mapId of mapIds) {
+        const encodedPixels = maps[mapId];
+        if (!encodedPixels) continue;
+        const canvas = document.createElement('canvas');
+        canvas.width = 128;
+        canvas.height = 128;
+        canvas.className = 'manual-captcha-map';
+        canvas.setAttribute('role', 'img');
+        canvas.setAttribute('aria-label', `Minecraft map ${mapId}`);
+        if (drawManualMap(canvas, encodedPixels)) {
+            const mapCard = document.createElement('figure');
+            mapCard.className = 'manual-captcha-map-card';
+            const caption = document.createElement('figcaption');
+            caption.textContent = `Map #${mapId}`;
+            mapCard.append(canvas, caption);
+            manualCaptchaMaps.appendChild(mapCard);
+        }
+    }
+
+    const waitingForMap = Array.from(mapIds).some(mapId => !maps[mapId]);
+    if (waitingForMap && mapIds.size > 0) {
+        const note = document.createElement('span');
+        note.className = 'manual-captcha-title';
+        note.textContent = 'Ожидаю данные изображения от сервера…';
+        manualCaptchaMaps.appendChild(note);
+    }
+
+    manualCaptchaSlots.replaceChildren();
+    manualCaptchaSlots.hidden = !window;
+    manualCaptchaHelp.textContent = window
+        ? 'Click a slot to send that click to the open Minecraft window.'
+        : 'Map images are shown here when received. Enter the CAPTCHA text yourself in the chat field.';
+    (window?.slots || []).forEach((item, slot) => {
+        if (!item) {
+            const emptySlot = document.createElement('span');
+            emptySlot.className = 'manual-captcha-empty-slot';
+            emptySlot.setAttribute('aria-hidden', 'true');
+            manualCaptchaSlots.appendChild(emptySlot);
+            return;
+        }
+
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'manual-captcha-slot';
+        button.dataset.captchaSlot = String(slot);
+        button.dataset.windowId = String(window.id);
+        button.setAttribute('aria-label', `Click slot ${slot + 1}: ${item.label || item.name}`);
+        button.title = [
+            item.label,
+            item.mapId !== null && item.mapId !== undefined ? `Map ID ${item.mapId}` : '',
+            ...(item.lore || [])
+        ].filter(Boolean).join('\n');
+
+        const itemName = document.createElement('span');
+        itemName.className = 'manual-captcha-slot-name';
+        itemName.textContent = item.mapId !== null && item.mapId !== undefined
+            ? `Map #${item.mapId}`
+            : (item.label || item.name || `Slot ${slot + 1}`);
+        button.appendChild(itemName);
+
+        if (item.count > 1) {
+            const count = document.createElement('span');
+            count.className = 'manual-captcha-slot-count';
+            count.textContent = `Г—${item.count}`;
+            button.appendChild(count);
+        }
+        manualCaptchaSlots.appendChild(button);
+    });
+}
+
+socket.on('manualWindowState', renderManualWindowState);
+
+// A server verification link arrived (XCord / BotSentry style). Open it in the
+// mini browser: /browser/open routes the session through the bot's proxy, so
+// the page is fetched from the very IP the bot joined from. The challenge
+// itself has to be confirmed by a person - that is what it is for.
+socket.on('captchaLink', async (payload) => {
+    if (!payload || !payload.url || !payload.username) return;
+    if (currentBot && payload.username !== currentBot) return;
+
+    if (browserUrl) browserUrl.value = payload.url;
+    setBrowserState('loading', 'Открываю страницу проверки...');
+    if (browserOpenBtn) browserOpenBtn.disabled = true;
+    browserRequestId += 1;
+    await openBrowserOverHttp(
+        { url: payload.url, profile: payload.username, username: payload.username },
+        browserRequestId
+    );
 });
 
 socket.on('chatHistory', (payload) => {
@@ -1188,7 +2279,42 @@ tabBtns.forEach(btn => {
         if (currentTab === 'watchlistPane') {
             renderWatchlist();
         }
+        if (currentTab === 'mapPane') {
+            renderMapPane();
+        }
     };
+});
+
+mapPaneZoom?.addEventListener('input', renderMapPane);
+mapPaneCols?.addEventListener('change', renderMapPane);
+mapPaneSave?.addEventListener('click', () => {
+    if (!currentMapCanvas) return;
+    const link = document.createElement('a');
+    link.download = `imperialsbot-maps-${Date.now()}.png`;
+    link.href = currentMapCanvas.toDataURL('image/png');
+    link.click();
+});
+mapPaneRotateAll?.addEventListener('click', () => {
+    for (const id of Object.keys(latestMapData)) {
+        mapPartRotations[id] = ((mapPartRotations[id] || 0) + 90) % 360;
+    }
+    renderMapPane();
+});
+
+function toggleMapOverlay(force) {
+    const overlay = document.getElementById('mapPaneOverlay');
+    if (!overlay) return;
+    overlay.hidden = force !== undefined ? !force : !overlay.hidden;
+    renderMapOverlay();
+}
+
+document.getElementById('mapPaneFullscreen')?.addEventListener('click', () => toggleMapOverlay(true));
+document.getElementById('mapPaneOverlayClose')?.addEventListener('click', () => toggleMapOverlay(false));
+document.getElementById('mapPaneOverlay')?.addEventListener('click', (event) => {
+    if (event.target.id === 'mapPaneOverlay') toggleMapOverlay(false);
+});
+document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') toggleMapOverlay(false);
 });
 
 const watchlistInput = document.getElementById('watchlistInput');
@@ -1472,7 +2598,7 @@ if (bulkGenerateForm) {
         const baseConfig = {
             host: rawData.host,
             port: parseInt(rawData.port) || 25565,
-            version: rawData.version || '1.21.11',
+            version: rawData.version || '1.21.4',
             auth: rawData.auth || 'offline',
             password: rawData.password || '',
             autoReconnect: formData.get('autoReconnect') === 'on',
@@ -1551,6 +2677,7 @@ addBotForm.onsubmit = (e) => {
 
 
     data.port = parseInt(data.port) || 0;
+    data.version = data.version || '1.21.4';
     data.proxyPort = parseInt(data.proxyPort) || 0;
     data.firstPerson = formData.get('firstPerson') === 'on';
     data.autoReconnect = formData.get('autoReconnect') === 'on';
@@ -2449,7 +3576,7 @@ function renderAnalyticsCards() {
             if (config.isHeatmap) {
                 statValEl.innerText = '';
             } else if (config.isObjectData && val) {
-                statValEl.innerText = `↓ ${val.rx} ↑ ${val.tx} ${config.unit}`;
+                statValEl.innerText = `в†“ ${val.rx} в†‘ ${val.tx} ${config.unit}`;
             } else if (config.isEventsData && val) {
                 statValEl.innerText = `${val.kills}K ${val.deaths}D ${val.itemsCollected}C`;
             } else {

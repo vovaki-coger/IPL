@@ -10,20 +10,50 @@ import readline from 'readline';
 
 const start = async () => {
     Logger.initGlobalLogging();
+
+    // If stdout is a pipe whose reader went away (background job cancelled,
+    // terminal detached), every console write throws EPIPE. That throw landed
+    // back in the uncaughtException handler below, which logged through console
+    // again and threw again -- an unbounded loop that pinned the event loop at
+    // 100% CPU and made the dashboard stop answering any request.
+    const swallowPipeErrors = (stream) => {
+        stream?.on?.('error', (err) => {
+            if (err && (err.code === 'EPIPE' || err.code === 'ERR_STREAM_DESTROYED')) return;
+            console.error('stream error:', err);
+        });
+    };
+    swallowPipeErrors(process.stdout);
+    swallowPipeErrors(process.stderr);
+
     await UpdateChecker.check();
+
+    // Reporting a failure must never be able to trigger another report.
+    let reporting = false;
+    const report = (level, message) => {
+        if (reporting) return;
+        reporting = true;
+        try {
+            if (level === 'WARNING') Logger.originalConsole.warn(message);
+            else Logger.originalConsole.error(message);
+            Logger.log(message, level);
+        } catch {
+            // Logging is best effort. A throw here must not re-enter.
+        } finally {
+            reporting = false;
+        }
+    };
 
     process.on('uncaughtException', (err) => {
         // Suppress known library-level TypeErrors that shouldn't crash the whole app
         const isInventoryCrash = err.message && err.message.includes("reading 'id'") && err.stack && err.stack.includes('mineflayer-web-inventory');
 
         if (isInventoryCrash) {
-            Logger.originalConsole.error('SUPPRESSED RECOVERABLE CRASH (Inventory):', err.message);
-            Logger.log(`Recovered from Inventory Viewer crash: ${err.message}`, 'WARNING');
+            report('WARNING', `Recovered from Inventory Viewer crash: ${err.message}`);
             return;
         }
 
-        Logger.originalConsole.error('UNCAUGHT EXCEPTION:', err);
-        Logger.log(`UNCAUGHT EXCEPTION: ${err.stack || err.message}`, 'CRITICAL');    });
+        report('CRITICAL', `UNCAUGHT EXCEPTION: ${err.stack || err.message}`);
+    });
 
     process.on('unhandledRejection', (reason, promise) => {
         const isTimeout = reason && (reason.code === 'ETIMEDOUT' || reason.name === 'AggregateError');
@@ -37,39 +67,16 @@ const start = async () => {
         Logger.log(`UNHANDLED REJECTION: ${reason}`, 'CRITICAL');
     });
 
-    let settings = await ConfigLoader.loadSettings();
-    let port = 3000;
-
-    if (!settings || !settings.port) {
-
-        if (!settings) {
-            const rl = readline.createInterface({
-                input: process.stdin,
-                output: process.stdout
-            });
-
-            const answer = await new Promise(resolve => {
-                rl.question('Enter server port (default 3000): ', resolve);
-            });
-
-            rl.close();
-
-            if (answer && answer.trim()) {
-                const parsed = parseInt(answer.trim());
-                if (!isNaN(parsed)) {
-                    port = parsed;
-                }
-            }
-            await ConfigLoader.saveSettings({ port });
-            console.log(`Port ${port} saved to settings.json.`);
-        } else {
-
-            await ConfigLoader.saveSettings({ port });
-        }
-
-    } else {
-        port = settings.port;
-        console.log(`Using configured port: ${port}`);
+    const settings = await ConfigLoader.loadSettings();
+    // PORT is authoritative in hosted environments. The old startup flow
+    // waited for a terminal question when settings.json was absent, which
+    // left server deployments stuck before opening their port.
+    const port = Number(process.env.PORT) || Number(settings?.port) || 3000;
+    if (process.env.PORT) {
+        console.log(`Using managed PORT: ${port}`);
+    } else if (!settings?.port) {
+        await ConfigLoader.saveSettings({ port });
+        console.log(`Port ${port} saved to settings.json.`);
     }
 
     const server = new ExpressServer(port);
@@ -80,18 +87,25 @@ const start = async () => {
     botManager.loadSavedBots();
     server.start();
 
-    const rl = readline.createInterface({
-        input: process.stdin,
-        output: process.stdout,
-        prompt: 'ImperialsBot > '
-    });
-
-    console.log('\x1b[36mImperialsBot CLI Ready. Type "help" for commands.\x1b[0m');
-    rl.prompt();
-
     AuditLogger.init();
 
-    rl.on('line', async (line) => {
+    // Keep the CLI for local terminal sessions, but never require stdin in a
+    // service/container where only the HTTP dashboard is available.
+    const interactiveCli = process.stdin.isTTY && process.env.IMPERIALS_DISABLE_CLI !== 'true';
+    const rl = interactiveCli
+        ? readline.createInterface({
+            input: process.stdin,
+            output: process.stdout,
+            prompt: 'ImperialsBot > '
+        })
+        : null;
+
+    if (rl) {
+        console.log('\x1b[36mImperialsBot CLI Ready. Type "help" for commands.\x1b[0m');
+        rl.prompt();
+    }
+
+    rl?.on('line', async (line) => {
         const trimmed = line.trim();
         if (!trimmed) {
             rl.prompt();

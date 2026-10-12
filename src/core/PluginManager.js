@@ -1,7 +1,7 @@
 import { EventEmitter } from 'events';
 import fs from 'fs';
 import path from 'path';
-import { pathToFileURL } from 'url';
+import { fileURLToPath, pathToFileURL } from 'url';
 import { PluginWrapper } from './PluginWrapper.js';
 import { PluginAPI } from './PluginAPI.js';
 
@@ -10,7 +10,10 @@ export class PluginManager extends EventEmitter {
         super();
         this.botClient = botClient;
         this.plugins = new Map();
-        this.pluginsDir = path.join(process.cwd(), 'src', 'plugins');
+        // Resolve from this module instead of process.cwd(). Published
+        // artifacts start from the workspace root, while development starts
+        // from the package directory.
+        this.pluginsDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'plugins');
         this.watcher = null;
     }
 

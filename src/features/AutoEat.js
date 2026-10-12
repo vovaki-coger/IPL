@@ -1,7 +1,8 @@
 import { BaseFeature } from './BaseFeature.js';
-import { createRequire } from 'module';
-const require = createRequire(import.meta.url);
-const autoEat = require('mineflayer-auto-eat');
+// mineflayer-auto-eat@5 is a pure ESM package ("type": "module"). require()
+// throws ERR_REQUIRE_ESM on Node < 20.19 and killed the whole process at
+// startup, because this import is reached through FeatureManager.
+import { loader as autoEatLoader } from 'mineflayer-auto-eat';
 
 export class AutoEat extends BaseFeature {
     init() {
@@ -11,15 +12,19 @@ export class AutoEat extends BaseFeature {
         const load = () => {
             try {
                 if (!bot.autoEat) {
-                    bot.loadPlugin(autoEat.loader || autoEat);
+                    bot.loadPlugin(autoEatLoader);
                 }
-                
+
                 if (bot.autoEat) {
-                    bot.autoEat.options = {
+                    // Options live in `opts` and are merged via setOpts().
+                    // There is no `startAt` in this version - the thresholds
+                    // are minHunger / minHealth.
+                    bot.autoEat.setOpts({
                         priority: 'foodPoints',
-                        startAt: 14,
+                        minHunger: 14,
+                        minHealth: 14,
                         bannedFood: []
-                    };
+                    });
                     // Restore enabled state from config
                     if (this.enabled) {
                         bot.autoEat.enableAuto();

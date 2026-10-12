@@ -6,6 +6,10 @@ export class AnalyticsManager extends BaseFeature {
         this.metrics = {};
         this.trackers = new Map();
         this.trackingInterval = null;
+        this.botEventBindings = [];
+        this.packetClient = null;
+        this.packetListener = null;
+        this.originalWrite = null;
         this.enabled = true;
 
         this.lastAge = 0;
@@ -68,7 +72,7 @@ export class AnalyticsManager extends BaseFeature {
     }
 
     init() {
-        this.botClient.bot.on('spawn', () => {
+        this.bindBotEvent('spawn', () => {
             if (this.trackingInterval) clearInterval(this.trackingInterval);
             this.lastAge = 0;
             this.lastAgeTime = 0;
@@ -77,15 +81,21 @@ export class AnalyticsManager extends BaseFeature {
             this.startTracking();
         });
 
-        this.botClient.bot.on('inject_allowed', () => {
+        this.bindBotEvent('inject_allowed', () => {
             if (this.botClient.bot && this.botClient.bot._client) {
-                this.botClient.bot._client.on('packet', (data, meta, buffer, fullBuffer) => {
+                if (this.packetClient === this.botClient.bot._client && this.packetListener) {
+                    return;
+                }
+                this.packetClient = this.botClient.bot._client;
+                this.packetListener = (data, meta, buffer, fullBuffer) => {
                     if (fullBuffer) this.bytesReceived += fullBuffer.length;
                     else if (buffer) this.bytesReceived += buffer.length;
-                });
+                };
+                this.packetClient.on('packet', this.packetListener);
 
-                const originalWrite = this.botClient.bot._client.write.bind(this.botClient.bot._client);
-                this.botClient.bot._client.write = (name, params) => {
+                this.originalWrite = this.packetClient.write;
+                const originalWrite = this.originalWrite.bind(this.packetClient);
+                this.packetClient.write = (name, params) => {
                     try {
                         let size = 1 + name.length;
                         if (params) {
@@ -98,25 +108,25 @@ export class AnalyticsManager extends BaseFeature {
             }
         });
 
-        this.botClient.bot.on('death', () => {
+        this.bindBotEvent('death', () => {
             this.eventsData.deaths++;
             this.botClient.emit('analyticsEvent', { type: 'death', message: 'Bot died' });
         });
 
-        this.botClient.bot.on('playerCollect', (collector, collected) => {
+        this.bindBotEvent('playerCollect', (collector, collected) => {
             if (collector === this.botClient.bot.entity) {
                 this.eventsData.itemsCollected++;
             }
         });
 
-        this.botClient.bot.on('entityDead', (entity) => {
+        this.bindBotEvent('entityDead', (entity) => {
             if (this.botClient.bot.pvp && this.botClient.bot.pvp.target === entity) {
                 this.eventsData.kills++;
                 this.botClient.emit('analyticsEvent', { type: 'kill', message: `Killed entity` });
             }
         });
 
-        this.botClient.bot.on('time', () => {
+        this.bindBotEvent('time', () => {
             if (!this.botClient.bot || !this.botClient.bot.time) return;
             const now = Date.now();
             const currentAge = this.botClient.bot.time.age;
@@ -143,12 +153,17 @@ export class AnalyticsManager extends BaseFeature {
             this.lastAgeTime = now;
         });
 
-        this.botClient.bot.on('end', () => {
+        this.bindBotEvent('end', () => {
             if (this.trackingInterval) {
                 clearInterval(this.trackingInterval);
                 this.trackingInterval = null;
             }
         });
+    }
+
+    bindBotEvent(event, listener) {
+        this.botClient.bot.on(event, listener);
+        this.botEventBindings.push({ event, listener });
     }
 
     startTracking() {
@@ -190,5 +205,27 @@ export class AnalyticsManager extends BaseFeature {
         } else if (enabled && !this.trackingInterval && this.botClient.bot) {
             this.startTracking();
         }
+    }
+
+    dispose() {
+        if (this.trackingInterval) {
+            clearInterval(this.trackingInterval);
+            this.trackingInterval = null;
+        }
+
+        for (const { event, listener } of this.botEventBindings) {
+            this.botClient.bot?.removeListener(event, listener);
+        }
+        this.botEventBindings = [];
+
+        if (this.packetClient && this.packetListener) {
+            this.packetClient.removeListener('packet', this.packetListener);
+        }
+        if (this.packetClient && this.originalWrite) {
+            this.packetClient.write = this.originalWrite;
+        }
+        this.packetClient = null;
+        this.packetListener = null;
+        this.originalWrite = null;
     }
 }

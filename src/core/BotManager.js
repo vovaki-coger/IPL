@@ -71,6 +71,16 @@ class BotManager extends EventEmitter {
             this.emit('botViewer', { username: config.username, ...data });
         });
 
+        bot.on('manualWindowState', (state) => {
+            this.emit('botManualWindowState', { username: config.username, ...state });
+        });
+
+        bot.on('captchaLink', (data) => {
+            this.emit('botCaptchaLink', { username: config.username, ...data });
+        });
+
+        
+
         bot.on('analyticsUpdate', (stat) => {
             this.emit('analyticsUpdate', { username: config.username, stat });
         });
@@ -122,7 +132,9 @@ class BotManager extends EventEmitter {
         const savedBots = await ConfigLoader.loadBots();
         for (const config of savedBots) {
             try {
-                await this.createBot(config, false, false);
+                // autoJoin defaults to true so a bot connects on its own after a
+                // server restart; set it to false to stay offline until Join.
+                await this.createBot(config, false, config.autoJoin !== false);
             } catch (err) {
                 console.error(`Failed to load saved bot ${config.username}:`, err);
             }

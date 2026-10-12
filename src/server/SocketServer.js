@@ -62,6 +62,16 @@ export class SocketServer {
             }
         });
 
+        botManager.on('botManualWindowState', (data) => {
+            this.io.to(`bot:${data.username}`).emit('manualWindowState', data);
+        });
+
+        botManager.on('botCaptchaLink', (data) => {
+            this.io.to(`bot:${data.username}`).emit('captchaLink', data);
+        });
+
+        
+
         botManager.on('analyticsUpdate', (data) => {
             if (!botManager.isGlobalHeadless) {
                 this.io.to(`bot:${data.username}`).emit('analyticsUpdate', data);
@@ -151,6 +161,16 @@ export class SocketServer {
                     socket.join(`bot:${username}`);
                     console.log(`Client ${socket.id} joined room bot:${username}`);
                 }
+            });
+
+            socket.on('requestManualWindow', (username) => {
+                if (typeof username !== 'string') return;
+                const bot = botManager.getBot(username);
+                if (!bot) return;
+                socket.emit('manualWindowState', {
+                    username,
+                    ...bot.getManualWindowState()
+                });
             });
 
             socket.on('shutdownServer', () => {
@@ -421,10 +441,39 @@ export class SocketServer {
                 const bot = botManager.getBot(username);
                 if (!bot) return;
 
+                // bot.bot is the live mineflayer client and stays null while the
+                // bot is offline. Dereferencing it unguarded threw on every
+                // dashboard click and flooded the log with unhandled rejections.
+                const requireLiveBot = () => {
+                    if (bot.bot && bot.bot.entity) return true;
+                    socket.emit('notification', {
+                        type: 'warning',
+                        message: `${username} is offline. Start the bot first.`
+                    });
+                    return false;
+                };
+
                 switch (action) {
                     case 'chat':
                         bot.featureManager.getFeature('chat').send(payload.message);
                         break;
+                    case 'captchaWindowClick': {
+                        const window = bot.bot?.currentWindow;
+                        const slot = Number(payload?.slot);
+                        const windowId = Number(payload?.windowId);
+                        const button = Number(payload?.button ?? 0);
+                        if (!window || Number(window.id) !== windowId ||
+                            !Number.isInteger(slot) || slot < 0 || slot >= Math.min(window.slots.length, 90) ||
+                            ![0, 1].includes(button)) {
+                            socket.emit('notification', {
+                                type: 'warning',
+                                message: 'That server window is no longer open. Wait for it to refresh and try again.'
+                            });
+                            break;
+                        }
+                        await bot.bot.clickWindow(slot, button, 0);
+                        break;
+                    }
                     case 'move':
                         const navigation = bot.featureManager.getFeature('navigation');
                         if (navigation) {
@@ -548,9 +597,10 @@ export class SocketServer {
                         bot.setLook(payload.yaw, payload.pitch);
                         break;
                     case 'respawn':
-                        bot.bot.respawn();
+                        if (requireLiveBot()) bot.bot.respawn();
                         break;
                     case 'click':
+                        if (!requireLiveBot()) break;
                         if (payload.type === 'left') {
                             bot.bot.swingArm('right');
 

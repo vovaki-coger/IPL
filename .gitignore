@@ -1,4 +1,4 @@
-# Node.js
+﻿# Node.js
 node_modules/
 npm-debug.log*
 yarn-debug.log*
@@ -27,3 +27,15 @@ tmp/
 public/temp/
 src/plugins/ServerSwitch.js
 logs/
+
+# Added locally: Python side and runtime artefacts
+.pythonlibs/
+logs/
+captcha_samples/
+downloaded_files/
+.replit-artifact/
+.pytest_cache/
+settings.json.bak
+server.out
+Thumbs.db
+desktop.ini

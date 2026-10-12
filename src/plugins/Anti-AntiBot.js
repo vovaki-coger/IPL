@@ -1,3 +1,29 @@
+import axios from 'axios';
+import { ConfigLoader } from '../config/ConfigLoader.js';
+
+const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
+// Server chat can contain any URL, including ones aimed at the machine running
+// these bots. Refuse to fetch anything that resolves inside a private network.
+function isPrivateHostname(hostname) {
+    const host = String(hostname || '').toLowerCase().replace(/^\[|\]$/g, '');
+    if (!host) return true;
+    if (host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local') ||
+        host.endsWith('.internal') || host === 'metadata.google.internal') {
+        return true;
+    }
+    const ipv4 = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+    if (ipv4) {
+        const [a, b] = ipv4.slice(1).map(Number);
+        if ([a, b].some(Number.isNaN)) return true;
+        if (a === 10 || a === 127 || a === 0) return true;
+        if (a === 172 && b >= 16 && b <= 31) return true;
+        if (a === 192 && b === 168) return true;
+        if (a === 169 && b === 254) return true;
+    }
+    return false;
+}
+
 export default class AntiAntiBot {
     constructor() {
         this.name = 'Anti-AntiBot';
@@ -9,11 +35,16 @@ export default class AntiAntiBot {
             bypassBotSentry: { type: 'boolean', label: 'Bypass BotSentry Checks', value: true },
             bypassBotFilter: { type: 'boolean', label: 'Bypass BungeeCord BotFilter', value: true },
             randomizeIdentity: { type: 'boolean', label: 'Randomize Client Identity', value: false },
-            jitterMode: { type: 'boolean', label: 'Passive Human Jitter', value: true },
+            // Rotating the view on a fixed 3-7s timer is a classic bot tell: no human
+            // produces constant angular deltas at a constant interval, and the
+            // server dropped the bot for suspected cheating while it was on.
+            jitterMode: { type: 'boolean', label: 'Passive Human Jitter', value: false },
             useBridge: { type: 'boolean', label: 'Use CAPTCHA Bridge', value: true },
             solveMath: { type: 'boolean', label: 'Solve Math Captchas', value: true },
             solveInventory: { type: 'boolean', label: 'Solve Inventory Captchas', value: true },
-            simulateGravity: { type: 'boolean', label: 'Simulate Gravity (Fake Lobby)', value: true },
+            autoVisitLinks: { type: 'boolean', label: 'Auto-Open Verification Links', value: true },
+            linkTimeoutMs: { type: 'number', label: 'Link Open Timeout (ms)', value: 12000 },
+            simulateGravity: { type: 'boolean', label: 'Simulate Gravity (Fake Lobby)', value: false },
             emulateVanillaPackets: { type: 'boolean', label: 'Emulate Vanilla Client Packets', value: true },
             smartBackoffMinutes: { type: 'number', label: 'Denial Backoff (Minutes)', value: 5 }
         };
@@ -30,6 +61,11 @@ export default class AntiAntiBot {
         this.consecutiveKicks = 0;
         this.lastKickTime = 0;
 
+        this.enabled = false;
+        this.botHandlers = null;
+        this.visitedLinks = new Map();
+        this.currentMapCode = null;
+
         this.botFilterState = {
             active: false,
             spawnY: 450,
@@ -45,13 +81,20 @@ export default class AntiAntiBot {
     init(bot, api) {
         this.bot = bot;
         this.api = api;
+        this.botClient = api?.botClient || null;
     }
 
     enable() {
-        this.api.on('messagestr', (msg) => this.handleChat(msg));
+        this.enabled = true;
+
+        // 'windowOpen' and 'spawn' are re-emitted by BotClient, so api.on works.
         this.api.on('windowOpen', (window) => this.handleWindow(window));
         this.api.on('spawn', () => this.handleSpawn());
-        this.api.on('kicked', (reason) => this.handleKicked(reason));
+
+        // BotClient does NOT re-emit 'messagestr' or 'kicked'. Subscribing to
+        // them through api.on registered dead listeners and every captcha branch
+        // below silently never ran. Bind straight to the mineflayer bot instead.
+        this.bindBotListeners();
 
         if (this.settings.jitterMode.value) {
             this.startJitter();
@@ -63,7 +106,48 @@ export default class AntiAntiBot {
     }
 
     disable() {
+        this.enabled = false;
+        this.unbindBotListeners();
         this._clearAllTimers();
+    }
+
+    bindBotListeners() {
+        this.unbindBotListeners();
+        const bot = this.api.bot;
+        if (!bot || typeof bot.on !== 'function') return;
+
+        this.botHandlers = {
+            message: (jsonMsg, position) => {
+                if (!this.enabled) return;
+                if (position === 'game_info') return;
+                // toString() keeps the section codes, which the colour captcha needs.
+                let text;
+                try {
+                    text = jsonMsg.toString();
+                } catch (e) {
+                    return;
+                }
+                if (!text || !text.trim()) return;
+                // Player chat must never trigger auto-answers or commands.
+                this.handleChat(text, !jsonMsg.username);
+            },
+            kicked: (reason) => {
+                if (!this.enabled) return;
+                this.handleKicked(reason);
+            }
+        };
+
+        bot.on('message', this.botHandlers.message);
+        bot.on('kicked', this.botHandlers.kicked);
+    }
+
+    unbindBotListeners() {
+        const bot = this.api?.bot;
+        if (bot && this.botHandlers && typeof bot.removeListener === 'function') {
+            bot.removeListener('message', this.botHandlers.message);
+            bot.removeListener('kicked', this.botHandlers.kicked);
+        }
+        this.botHandlers = null;
     }
 
     _clearAllTimers() {
@@ -138,6 +222,10 @@ export default class AntiAntiBot {
         });
 
         this.bot.on('move', () => {
+            // The fake lobby must never start on its own: it replaces real
+            // physics with packets that look nothing like a genuine fall, and
+            // servers that hold players above y=150 would trigger it always.
+            if (!this.settings.simulateGravity.value) return;
             if (this.botFilterState.active || !this.settings.bypassBotFilter.value) return;
             if (this.bot.entity.position.y > 150 && !this.pendingGravity && !this.hasLanded) {
                 this._handleFakeLobby();
@@ -159,6 +247,10 @@ export default class AntiAntiBot {
         this.hasLanded = false;
         this.pendingGravity = false;
         this.lastGroundY = null;
+
+        // A reconnect replaces the mineflayer instance, so the old listeners
+        // are gone with the old bot. Re-attach to the new one.
+        this.bindBotListeners();
 
         if (this.settings.emulateVanillaPackets.value) {
             this._emulateVanillaLogin();
@@ -263,62 +355,104 @@ export default class AntiAntiBot {
         if (this.gravityTimer) { clearInterval(this.gravityTimer); this.gravityTimer = null; }
     }
 
-    async handleChat(msg) {
-        const lower = msg.toLowerCase();
+    async handleChat(msg, fromServer = true) {
+        if (!fromServer) return;
+        const plain = String(msg).replace(/§[0-9a-fk-orA-FK-OR]/g, '');
+        const lower = plain.toLowerCase();
 
         if (this.settings.solveMath.value) {
+            // The keyword has to sit next to the expression. A bare
+            // "digit op digit" pattern matched any line with two numbers
+            // (progress counters, coordinates) and answered them, spamming
+            // chat every few seconds until the server kicked the bot.
             const mathPatterns = [
-                /(?:solve|answer|what\s+is|calculate|type|enter)\s*:?\s*(\d+)\s*([\+\-\*\/x])\s*(\d+)/i,
-                /(\d+)\s*([\+\-\*\/x])\s*(\d+)\s*(?:=\s*\?|solve|answer)/i,
-                /(\d+)\s*([\+\-\*\/x])\s*(\d+)/
+                /(?:solve|answer|what\s+is|calculate|type|enter)\s*:?\s*(-?\d+)\s*([\+\-\*\/x])\s*(-?\d+)/i,
+                /(-?\d+)\s*([\+\-\*\/x])\s*(-?\d+)\s*(?:=\s*\?|solve|answer)/i
             ];
 
             for (const pattern of mathPatterns) {
-                const match = msg.match(pattern);
-                if (match && (lower.includes('solve') || lower.includes('what') ||
-                    lower.includes('calculate') || lower.includes('answer') ||
-                    lower.includes('type') || lower.includes('enter') ||
-                    lower.includes('captcha') || lower.includes('verify'))) {
+                const match = plain.match(pattern);
+                if (!match) continue;
 
-                    const num1 = parseInt(match[1]);
-                    const op = match[2] === 'x' ? '*' : match[2];
-                    const num2 = parseInt(match[3]);
-                    let ans;
+                const num1 = parseInt(match[1], 10);
+                const op = match[2] === 'x' ? '*' : match[2];
+                const num2 = parseInt(match[3], 10);
+                if (!Number.isFinite(num1) || !Number.isFinite(num2)) continue;
+                if (op === '/' && num2 === 0) continue;
 
-                    switch (op) {
-                        case '+': ans = num1 + num2; break;
-                        case '-': ans = num1 - num2; break;
-                        case '*': ans = num1 * num2; break;
-                        case '/': ans = Math.floor(num1 / num2); break;
-                        default: continue;
-                    }
-
-                    this.log(`Math captcha solved: ${num1} ${op} ${num2} = ${ans}`, 'success');
-                    const delay = 1500 + Math.random() * 2000;
-                    setTimeout(() => { this.api.chat(ans.toString()); }, delay);
-                    return;
+                let ans;
+                switch (op) {
+                    case '+': ans = num1 + num2; break;
+                    case '-': ans = num1 - num2; break;
+                    case '*': ans = num1 * num2; break;
+                    case '/': ans = Math.floor(num1 / num2); break;
+                    default: continue;
                 }
+                if (!Number.isFinite(ans)) continue;
+
+                // One answer per captcha, not one per repeated reminder.
+                const now = Date.now();
+                if (this.lastMathAnswer && now - this.lastMathAnswer < 20000) return;
+                this.lastMathAnswer = now;
+
+                this.log(`Math captcha solved: ${num1} ${op} ${num2} = ${ans}`, 'success');
+                const delay = 1500 + Math.random() * 2000;
+                setTimeout(() => { this.api.chat(ans.toString()); }, delay);
+                return;
             }
         }
 
         if (this.botFilterState.active && this.settings.bypassBotFilter.value) {
-            if (lower.includes('введите') || lower.includes('капч') ||
+            if (lower.includes('введите') || lower.includes('капч') || lower.includes('капча') ||
                 lower.includes('captcha') || lower.includes('номер') ||
                 lower.includes('картинк') || lower.includes('number from')) {
                 this.log('BotFilter captcha detected. Forwarding to dashboard/Discord.', 'warning');
-                this.triggerBridgeAlert(`botfilter-captcha://${msg}`);
+                this.triggerBridgeAlert(`botfilter-captcha://${plain}`);
             }
         }
 
-        const linkMatch = msg.match(/(https?:\/\/[^\s]+)/);
+        const linkMatch = plain.match(/(https?:\/\/[^\s<>"']+)/);
         if (linkMatch) {
             const url = linkMatch[1];
-            const isXCord = lower.includes('xcord') || lower.includes('verify');
-            const isBotSentry = lower.includes('botsentry') || lower.includes('notbot.es');
+            // ReallyWorld phrases it as "Captcha » 1. Перейдите на наш сайт по
+            // ссылке ниже" with no xcord/verify wording, so keying only on the
+            // vendor names meant the link was silently dropped.
+            const looksLikeVerification =
+                lower.includes('xcord') || lower.includes('verify') || lower.includes('verification') ||
+                lower.includes('botsentry') || lower.includes('notbot.es') ||
+                lower.includes('captcha') || lower.includes('капч') || lower.includes('капча') ||
+                lower.includes('проверк') || lower.includes('подтверд') ||
+                lower.includes('перейдите на наш сайт');
 
-            if ((isXCord && this.settings.bypassXCord.value) || (isBotSentry && this.settings.bypassBotSentry.value)) {
+            if (looksLikeVerification && (this.settings.bypassXCord.value || this.settings.bypassBotSentry.value)) {
+                // The server repeats the reminder every few seconds, each time
+                // with a brand new one-time URL. Repeating it just floods the
+                // dashboard with links that are already dead.
+                const stamp = Date.now();
+                if (this.lastCaptchaLink === url && stamp - this.lastCaptchaLinkAt < 60000) {
+                    return;
+                }
+                this.lastCaptchaLink = url;
+                this.lastCaptchaLinkAt = stamp;
+
                 this.log(`Verification link detected: ${url}`, 'info');
-                this.triggerBridgeAlert(url);
+                // Try to complete the check from the bot's own IP first, only
+                // escalate to a human when the request is rejected or fails.
+                const solved = this.settings.autoVisitLinks.value
+                    ? await this.visitVerificationLink(url)
+                    : false;
+                // The dashboard opens this in a real browser routed through the
+                // bot's proxy, so the page loads from the bot's own IP. The
+                // challenge itself (a Cloudflare Turnstile checkbox) has to be
+                // ticked by a person - that is the whole point of it.
+                this.api.botClient.emit('captchaLink', {
+                    url,
+                    solved,
+                    reason: solved ? 'link-opened' : 'needs-human'
+                });
+                if (!solved) {
+                    this.triggerBridgeAlert(url);
+                }
             }
         }
 
@@ -340,8 +474,10 @@ export default class AntiAntiBot {
             }
 
             if (lower.includes('enter the code') || lower.includes('type the code')) {
-                const codeMatch = msg.match(/(?:code|number)[:\s]*(\d+)/i);
+                const codeMatch = plain.match(/(?:code|number)[:\s]*(\d+)/i);
                 if (codeMatch) {
+                    // Remember it: a map captcha window may open right after.
+                    this.currentMapCode = codeMatch[1];
                     this.log(`BotSentry code challenge: answering "${codeMatch[1]}"`, 'success');
                     setTimeout(() => this.api.chat(codeMatch[1]), 1000 + Math.random() * 1500);
                     return;
@@ -358,6 +494,97 @@ export default class AntiAntiBot {
                 }
             }
         }
+
+        // Generic code prompt. Map/image captchas usually print the expected
+        // code in chat ("enter the code: 4821"), so remember it for the GUI.
+        if (lower.includes('enter the code') || lower.includes('type the code') ||
+            lower.includes('enter the number') || lower.includes('введите код') ||
+            lower.includes('введите число') || lower.includes('введите номер')) {
+            const codeMatch = plain.match(/(?:code|number|код|число|номер)[:\s]*([A-Za-z0-9]{3,10})/i);
+            if (codeMatch) {
+                this.currentMapCode = codeMatch[1];
+                this.log(`Captcha code seen in chat: "${this.currentMapCode}"`, 'info');
+                if (lower.includes('enter') || lower.includes('type') || lower.includes('введите')) {
+                    this.log(`Answering code challenge: "${this.currentMapCode}"`, 'success');
+                    setTimeout(() => this.api.chat(this.currentMapCode), 900 + Math.random() * 1200);
+                    return;
+                }
+            }
+        }
+    }
+
+    getBotProxyUrl() {
+        const config = this.api.botClient?.config;
+        if (!config || !config.proxyType || config.proxyType === 'none') return null;
+        let auth = '';
+        if (config.proxyUser && config.proxyPass) {
+            auth = `${encodeURIComponent(config.proxyUser)}:${encodeURIComponent(config.proxyPass)}@`;
+        } else if (config.proxyUser) {
+            auth = `${encodeURIComponent(config.proxyUser)}@`;
+        }
+        return `${config.proxyType}://${auth}${config.proxyHost}:${config.proxyPort}`;
+    }
+
+    // Link captchas are bound to the IP that the bot connects from, so the
+    // request has to leave through the very same proxy as the game session.
+    async visitVerificationLink(url) {
+        const lastVisit = this.visitedLinks.get(url);
+        if (lastVisit && Date.now() - lastVisit < 120000) {
+            return false;
+        }
+        this.visitedLinks.set(url, Date.now());
+
+        let parsed;
+        try {
+            parsed = new URL(url);
+        } catch (e) {
+            this.log('Verification link is not a valid URL.', 'warning');
+            return false;
+        }
+
+        if (isPrivateHostname(parsed.hostname)) {
+            this.log('Verification link points at a private address - refused.', 'warning');
+            return false;
+        }
+
+        const timeout = Math.max(3000, Number(this.settings.linkTimeoutMs.value) || 12000);
+        const request = {
+            timeout,
+            maxRedirects: 5,
+            validateStatus: () => true,
+            responseType: 'text',
+            headers: {
+                'User-Agent': BROWSER_UA,
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.9'
+            }
+        };
+
+        const proxyUrl = this.getBotProxyUrl();
+        if (proxyUrl) {
+            request.proxy = proxyUrl;
+        }
+
+        try {
+            const res = await axios.get(url, request);
+            const body = String(res.data || '').toLowerCase();
+            const failed = res.status >= 400 ||
+                body.includes('access denied') || body.includes('not verified') ||
+                body.includes('verification failed') || body.includes('captcha failed') ||
+                body.includes('invalid token') || body.includes('link expired') ||
+                body.includes('вы не прошли') || body.includes('проверка не пройдена');
+
+            if (failed) {
+                this.log(`Link opened but server rejected it (HTTP ${res.status}). Falling back to manual.`, 'warning');
+                return false;
+            }
+
+            this.log(`Verification link opened successfully (HTTP ${res.status}${proxyUrl ? ', via proxy' : ''}).`, 'success');
+            return true;
+        } catch (err) {
+            this.log(`Could not open verification link: ${err.message}. Falling back to manual.`, 'warning');
+            return false;
+        }
     }
 
     async triggerBridgeAlert(url) {
@@ -365,7 +592,9 @@ export default class AntiAntiBot {
 
         if (this.settings.useBridge.value) {
             try {
-                const settings = await this.api.botClient.config.constructor.loadSettings() || {};
+                // config.constructor is Object - this always threw a TypeError
+                // and was swallowed, so the bridge URL was never applied.
+                const settings = await ConfigLoader.loadSettings() || {};
                 const baseUrl = settings.publicDashboardUrl;
                 if (baseUrl) {
                     finalUrl = `${baseUrl.replace(/\/$/, '')}/bridge/solve?bot=${encodeURIComponent(this.api.botClient.username)}&target=${encodeURIComponent(url)}`;
@@ -408,9 +637,10 @@ export default class AntiAntiBot {
 
         const cleanTitle = title.replace(/§[0-9a-fk-or]/gi, '').toLowerCase().trim();
 
-        const isCaptchaWindow = cleanTitle.includes('captcha') || cleanTitle.includes('verify') ||
+        const isCaptchaWindow = cleanTitle.includes('captcha') || cleanTitle.includes('verif') ||
             cleanTitle.includes('click the') || cleanTitle.includes('select') ||
-            cleanTitle.includes('bot check') || cleanTitle.includes('anti-bot');
+            cleanTitle.includes('bot check') || cleanTitle.includes('anti-bot') ||
+            cleanTitle.includes('капч') || cleanTitle.includes('проверк');
 
         if (!isCaptchaWindow) return;
 
@@ -432,6 +662,38 @@ export default class AntiAntiBot {
                 try { this.bot.clickWindow(target.slot, 0, 0); } catch (e) {}
                 return;
             }
+        }
+
+        const mapSlots = items.filter(item =>
+            item && item.type !== -1 && /(^|:)filled_map$/.test(String(item.name || ''))
+        );
+        if (mapSlots.length) {
+            // The image itself cannot be read without OCR, but the answer is
+            // very often printed in chat right before the window opens.
+            const wantsCode = cleanTitle.includes('code') || cleanTitle.includes('number') ||
+                cleanTitle.includes('type') || cleanTitle.includes('enter') ||
+                cleanTitle.includes('код') || cleanTitle.includes('число');
+
+            if (wantsCode && this.currentMapCode) {
+                this.log(`Map captcha: answering with code "${this.currentMapCode}" from chat.`, 'success');
+                setTimeout(() => this.api.chat(this.currentMapCode), 700 + Math.random() * 900);
+                return;
+            }
+
+            const mapLabels = mapSlots.map(item => `${item.displayName || ''} ${(item.lore || []).join(' ')}`);
+            const codeFromLore = mapLabels.join(' ').match(/\b(\d{3,10})\b/);
+            if (wantsCode && codeFromLore) {
+                this.log(`Map captcha: answering with code "${codeFromLore[1]}" from item lore.`, 'success');
+                setTimeout(() => this.api.chat(codeFromLore[1]), 700 + Math.random() * 900);
+                return;
+            }
+
+            // Nothing readable - hand it to a human. The dashboard already
+            // renders the map image for this window, so it is one click away.
+            this.log(`Map captcha needs a human (${mapSlots.length} map slot(s), title "${cleanTitle}"). Escalating.`, 'warning');
+            this.currentMapCode = null;
+            this.triggerBridgeAlert(`map-captcha://${encodeURIComponent(cleanTitle || 'captcha')}`);
+            return;
         }
 
         const verifyItem = items.find(item =>

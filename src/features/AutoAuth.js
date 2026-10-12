@@ -2,6 +2,11 @@ import { BaseFeature } from './BaseFeature.js';
 import { ConfigLoader } from '../config/ConfigLoader.js';
 
 export class AutoAuth extends BaseFeature {
+    constructor(botClient) {
+        super(botClient);
+        this.authRunId = 0;
+    }
+
     init() {
         this.enabled = this.botClient.config.autoAuth !== false;
 
@@ -29,6 +34,7 @@ export class AutoAuth extends BaseFeature {
 
     disable() {
         this.enabled = false;
+        this.authRunId++;
         this.botClient.log('AutoAuth disabled', 'warning');
     }
 
@@ -39,9 +45,16 @@ export class AutoAuth extends BaseFeature {
 
         if (!this.enabled) return;
         if (!this.botClient.bot || !this.botClient.bot._client) return;
+        const runId = ++this.authRunId;
 
         const password = this.botClient.config.password;
-        if (!password) return;
+        if (!password) {
+            // BotClient blocks plugin startup on authCompleted. Returning
+            // silently here meant that signal never arrived and the plugins
+            // stayed dead for the whole session.
+            this.botClient.emit('authCompleted');
+            return;
+        }
 
         this.botClient.log('AutoAuth: Attempting authentication...', 'info');
 
@@ -57,6 +70,7 @@ export class AutoAuth extends BaseFeature {
 
             const safeChat = (cmd) => {
                 const tryChat = (attempts = 0) => {
+                    if (runId !== this.authRunId) return;
                     try {
                         if (this.botClient.bot && this.botClient.bot.chat) {
                             this.botClient.bot.chat(cmd);
@@ -71,14 +85,21 @@ export class AutoAuth extends BaseFeature {
 
             safeChat(registerCmd);
             await new Promise(resolve => setTimeout(resolve, 1200));
+            if (runId !== this.authRunId) return;
             safeChat(loginCmd);
 
             // Signal completion
             setTimeout(() => {
-                this.botClient.emit('authCompleted');
+                if (runId === this.authRunId) {
+                    this.botClient.emit('authCompleted');
+                }
             }, 1000);
         } catch (err) {
             this.botClient.log(`AutoAuth Error: ${err.message}`, 'error');
         }
+    }
+
+    dispose() {
+        this.authRunId++;
     }
 }

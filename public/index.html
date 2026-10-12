@@ -97,6 +97,59 @@
                     </div>
                 </div>
 
+                <section class="browser-panel" id="browserPanel" aria-label="Mini browser">
+                    <div class="browser-panel-header">
+                        <div class="browser-panel-title">
+                            <span class="browser-glyph" aria-hidden="true">
+                                <svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24"
+                                    fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"
+                                    stroke-linejoin="round">
+                                    <rect x="3" y="4" width="18" height="16" rx="2"></rect>
+                                    <path d="M3 9h18"></path>
+                                    <path d="M7 6.5h.01M10 6.5h.01"></path>
+                                </svg>
+                            </span>
+                            <span>Mini Browser</span>
+                        </div>
+                        <div class="browser-session" id="browserSession" data-state="idle" aria-live="polite">
+                            <span class="browser-session-dot" aria-hidden="true"></span>
+                            <span id="browserSessionText">No active session</span>
+                        </div>
+                    </div>
+                    <form class="browser-form" id="browserForm" autocomplete="off">
+                        <label class="browser-field browser-url-field">
+                            <span class="browser-sr-only">Page URL</span>
+                            <input id="browserUrl" name="url" type="url" inputmode="url"
+                                placeholder="https://example.com" spellcheck="false" required>
+                        </label>
+                        <label class="browser-field browser-profile-field">
+                            <span class="browser-sr-only">Bot or proxy profile</span>
+                            <select id="browserProfile" name="profile">
+                                <option value="">Current bot / proxy</option>
+                            </select>
+                        </label>
+                        <button class="browser-open-btn" id="browserOpenBtn" type="submit">
+                            <span>Open</span>
+                            <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24"
+                                fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                                stroke-linejoin="round" aria-hidden="true">
+                                <path d="M5 12h14"></path>
+                                <path d="m13 6 6 6-6 6"></path>
+                            </svg>
+                        </button>
+                    </form>
+                    <div class="browser-toolbar" id="browserToolbar" hidden aria-label="Browser controls">
+                        <button type="button" id="browserBack" aria-label="Go back" title="Back">←</button>
+                        <button type="button" id="browserForward" aria-label="Go forward" title="Forward">→</button>
+                        <button type="button" id="browserReload" aria-label="Reload page" title="Reload">↻</button>
+                        <span>Click the page to interact · scroll to move · type after focusing a field</span>
+                    </div>
+                    <div class="browser-error" id="browserError" role="alert" aria-live="assertive"></div>
+                    <div class="browser-viewport" id="browserViewport" hidden>
+                        <iframe id="browserFrame" title="Server browser" referrerpolicy="no-referrer"></iframe>
+                    </div>
+                </section>
+
                 <div class="stats-panel" id="statsPanel">
                     <div class="stat-column">
                         <div class="stat-group">
@@ -207,6 +260,7 @@
                 <div class="column right-col">
                     <div class="tabs-header">
                         <button class="tab-btn active" data-tab="controlsPane">Controls</button>
+                        <button class="tab-btn" data-tab="mapPane">Карта</button>
                         <button class="tab-btn" data-tab="analyticsPane">Analytics</button>
                         <button class="tab-btn" data-tab="bulkPane">Bulk</button>
                         <button class="tab-btn" data-tab="devPane">Dev</button>
@@ -220,6 +274,26 @@
                             <div class="viewer-container" id="viewerContainer">
                                 <div class="placeholder">Viewer Offline</div>
                             </div>
+                            <div class="snapshot-controls">
+                                <button id="snapshotBtn" type="button">Снять карту вокруг бота</button>
+                                <span id="snapshotInfo" class="snapshot-info"></span>
+                            </div>
+                            <div id="snapshotResult" class="snapshot-result" hidden>
+                                <img id="snapshotImg" alt="Карта блоков вокруг бота" />
+                            </div>
+                            <section id="manualCaptchaPanel" class="manual-captcha-panel" hidden
+                                aria-live="polite" aria-label="Manual server challenge controls">
+                                <div class="manual-captcha-heading">
+                                    <div>
+                                    <strong>Server challenge</strong>
+                                        <div id="manualCaptchaTitle" class="manual-captcha-title"></div>
+                                    </div>
+                                    <span class="manual-captcha-badge">Manual input</span>
+                                </div>
+                                <div id="manualCaptchaMaps" class="manual-captcha-maps"></div>
+                                <div id="manualCaptchaSlots" class="manual-captcha-slots"></div>
+                                <p id="manualCaptchaHelp" class="manual-captcha-help">Click a slot to send that click to the open Minecraft window.</p>
+                            </section>
                         </div>
 
                         <div class="card controls-card">
@@ -368,6 +442,51 @@
                         <div class="card players-card">
                             <h3>Online Players (<span id="playerCount">0</span>)</h3>
                             <div class="player-list" id="playerList"></div>
+                        </div>
+                    </div>
+
+                    <div id="mapPane" class="tab-pane">
+                        <div class="card map-pane-card">
+                            <h3>Карта <span id="mapPaneBadge" class="manual-captcha-badge"
+                                    style="margin-left:8px;">Ожидание</span></h3>
+                            <div id="mapPaneOverlay" class="map-pane-overlay" hidden>
+                                <div class="map-pane-overlay-box">
+                                    <div id="mapPaneOverlayBody" class="map-pane-overlay-body"></div>
+                                    <button type="button" class="btn" id="mapPaneOverlayClose">Закрыть (Esc)</button>
+                                </div>
+                            </div>
+                            <div class="map-pane-toolbar">
+                                <div class="map-pane-options">
+                                    <label class="map-pane-toggle">
+                                        <input type="checkbox" id="mapPaneAssemble" checked>
+                                        Собрать в одну картинку
+                                    </label>
+                                    <button type="button" class="btn" id="mapPaneSave">Сохранить PNG</button>
+                                    <button type="button" class="btn" id="mapPaneRotateAll">Повернуть все на 90°</button>
+                                    <button type="button" class="btn" id="mapPaneFullscreen">Во весь экран</button>
+                                </div>
+                                <div class="map-pane-zoom">
+                                    <label for="mapPaneCols">В ряд</label>
+                                    <select id="mapPaneCols">
+                                        <option value="auto" selected>Авто</option>
+                                        <option value="3">3</option>
+                                        <option value="4">4</option>
+                                        <option value="6">6</option>
+                                        <option value="8">8</option>
+                                        <option value="12">12</option>
+                                    </select>
+                                    <label for="mapPaneZoom">Масштаб</label>
+                                    <input type="range" id="mapPaneZoom" min="1" max="4" step="1" value="1">
+                                    <span id="mapPaneZoomValue">1x</span>
+                                </div>
+                            </div>
+                            <div id="mapPaneStage" class="map-pane-stage">
+                                <div class="placeholder">Карта появится, когда сервер её пришлёт</div>
+                            </div>
+                            <div class="map-pane-footer">
+                                <span id="mapPaneCoords">Наведи курсор на карту, чтобы увидеть координаты</span>
+                            </div>
+                            <p class="map-pane-help">Все карты показаны сразу, каждая целиком. Наведи, чтобы увидеть номер. Правая кнопка — повернуть карту на 90°.</p>
                         </div>
                     </div>
 
@@ -688,7 +807,7 @@
 
                 <div class="form-group">
                     <label>Version</label>
-                    <input type="text" name="version" placeholder="Auto (if empty)">
+                    <input type="text" name="version" value="1.21.4" placeholder="1.21.4">
                 </div>
                 <div class="form-group">
                     <label>Discord Integration</label>
@@ -967,7 +1086,7 @@
 
                 <div class="form-group">
                     <label>Version</label>
-                    <input type="text" name="version" placeholder="Auto (if empty)">
+                    <input type="text" name="version" value="1.21.4" placeholder="1.21.4">
                 </div>
                 <div class="form-group">
                     <label>Discord Integration</label>
@@ -1114,7 +1233,7 @@
                 </div>
                 <div class="form-group">
                     <label>Version</label>
-                    <input type="text" name="version" placeholder="Auto (if empty)">
+                    <input type="text" name="version" value="1.21.4" placeholder="1.21.4">
                 </div>
 
                 <div class="card"
@@ -1183,7 +1302,7 @@
     </div>
 
     <script src="/socket.io/socket.io.js"></script>
-    <script src="app.js"></script>
+    <script src="app.js?v=20260911-1"></script>
 </body>
 
 </html>
